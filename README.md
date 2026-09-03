@@ -101,7 +101,7 @@ premier appel. `ABO_ENGINE_DATA` n'est plus lu par aucun service.
 
 | image | contenu |
 |---|---|
-| `abo-worker-agent:v1` | l'agent, 196 Mo, sans poids ni torch |
+| `abo-worker-agent:0.4.0` | l'agent, 196 Mo, sans poids ni torch — `v1` pointe dessus |
 | `abo-engine-base:cuda` | le socle torch partagé par trois moteurs |
 | `abo-deepfilternet:v1` | nettoyage rapide, processeur, 268 Mo |
 | `abo-clearervoice:v1` | rehaussement 48 kHz, GPU |

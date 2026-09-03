@@ -38,7 +38,15 @@
 services:
   agent:
     build: ../agent
-    image: antoninocanta/abo-worker-agent:v1
+    # Reference par **digest**, et pas seulement par tag. Un tag mobile n'est
+    # pas retelecharge par une machine qui l'a deja en cache : elle sert
+    # l'ancienne image sans que rien ne le signale, et ca coute une location de
+    # GPU pour rien. Le tag reste devant pour qu'on sache lire ce qu'on epingle.
+    #
+    # 0.4.0 : le profil de voix arrive en concession (`ABOB-137`). Une machine
+    # tiree d'une image anterieure fonctionne toujours — le backend lui sert
+    # l'ancienne forme — mais elle repaie 33 Mo a chaque defaut de cache.
+    image: antoninocanta/abo-worker-agent:0.4.0@sha256:368bd41fb6253d66c5e513840818fd5e9a42fcb8b555ca0fca4bd99ad3e3110e
     restart: unless-stopped
     environment:
       ABO_BACKEND_URL: ${ABO_BACKEND_URL:-https://api.abo.example}
