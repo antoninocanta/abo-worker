@@ -220,6 +220,22 @@ il ne le définit pas.
   pouls, tire un job, appelle le moteur sur `127.0.0.1` et rend le résultat.
   Aucun port ouvert. `agent/tests/fake_engine.py` rend un WAV valide pour
   éprouver la chaîne sans carte.
+- **L'agent suit des concessions au lieu de recevoir des octets** (0.3.0,
+  `ABOB-136`, `ADR-010`). Le bail ne porte plus `audioB64` ni `referenceB64`
+  mais une **référence** et une concession : où aller chercher l'entrée, où
+  déposer la sortie. L'agent suit, il ne construit rien — le jour où l'adresse
+  désignera un stockage objet au lieu d'une route d'ABO, ce code ne bougera pas.
+
+  **C'est la version qui décide**, et le backend la lit : en dessous de 0.3.0 il
+  sert l'ancienne forme. Une machine tirée d'une image ancienne continue donc de
+  fonctionner — sur une location, échouer au premier travail coûterait l'heure
+  quand même. Ne pas baisser `AGENT_VERSION` sans retirer le code qui va avec.
+
+  **Les moteurs ne changent pas.** Ils parlent toujours JSON et base64 sur
+  `127.0.0.1`, où le tiers de volume ne se paie pas ; ce qui coûtait cher était
+  le même tiers sur le lien montant. Les cinq images restent telles quelles,
+  seule celle de l'agent est à reconstruire.
+
 - **L'agent attend son moteur avant de s'enrôler** (0.2.0, `ABOB-128`). Il
   interroge `/health` et exige `engine: true` ; sans cela il renonce plutôt que
   de rejoindre la ferme. S'enrôler d'abord et découvrir ensuite ferait entrer

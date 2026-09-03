@@ -24,6 +24,8 @@ Configuration, par l'environnement :
                          combien de temps un moteur a pour devenir servable
                          avant que l'agent renonce a rejoindre la ferme
 """
+import base64
+import hashlib
 import logging
 import os
 import platform
@@ -34,7 +36,12 @@ import time
 
 import httpx
 
-AGENT_VERSION = "0.2.0"
+# 0.3.0 : l'agent suit des **concessions** au lieu de recevoir des octets
+# (`ADR-010` § 6). Le backend lit cette version pour decider laquelle des deux
+# formes il sert : une machine qui declare moins que 0.3.0 continue de recevoir
+# du base64, donc une image ancienne ne casse pas au premier travail d'un
+# utilisateur. Ne pas la baisser sans retirer le code qui va avec.
+AGENT_VERSION = "0.3.0"
 
 BACKEND_URL = os.getenv("ABO_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 WORKER_KEY = os.getenv("ABO_WORKER_KEY", "")
@@ -269,6 +276,60 @@ class Backend:
         response.raise_for_status()
         return response.json()["voiceB64"]
 
+    def fetch(self, grant: dict) -> bytes:
+        """Suit une concession de lecture, et rend les octets.
+
+        La concession dit **quelle requete faire** — verbe, adresse, en-tetes —
+        et l'agent ne fait que la suivre. C'est ce qui permet au backend de
+        changer le chemin des octets sans toucher a ce code : aujourd'hui
+        l'adresse est une route d'ABO, demain un stockage objet, et l'agent ne
+        verra pas la difference.
+
+        Le secret de la machine n'est ajoute que sur une adresse **relative**,
+        c'est-a-dire sur notre propre API. Une adresse absolue designe un tiers,
+        et lui presenter ce secret le lui donnerait.
+        """
+        url = grant["url"]
+        headers = dict(grant.get("headers") or {})
+        if url.startswith("/"):
+            url = BACKEND_URL + url
+            headers.update(self._headers)
+        response = self._client.request(
+            grant.get("method", "GET"), url, headers=headers, timeout=BACKEND_TIMEOUT
+        )
+        response.raise_for_status()
+        return response.content
+
+    def deposit(
+        self,
+        grant: dict,
+        attempt: int,
+        payload: bytes,
+        content_type: str,
+        kind: str = "output",
+    ) -> dict:
+        """Depose des octets bruts, et rend la reference que le backend frappe.
+
+        Plus de base64 sur ce chemin : c'est le tiers de volume qu'il coutait,
+        et il n'achetait rien qu'un corps JSON.
+        """
+        url = grant["url"]
+        headers = dict(grant.get("headers") or {})
+        if url.startswith("/"):
+            url = BACKEND_URL + url
+            headers.update(self._headers)
+        headers["Content-Type"] = content_type
+        response = self._client.request(
+            grant.get("method", "POST"),
+            url,
+            params={"attempt": attempt, "kind": kind},
+            content=payload,
+            headers=headers,
+            timeout=BACKEND_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def result(self, job_id: str, attempt: int, payload: dict) -> None:
         response = self._post(f"/jobs/{job_id}/result", {**payload, "attempt": attempt})
         response.raise_for_status()
@@ -285,6 +346,35 @@ class Backend:
 
 class EngineError(RuntimeError):
     """Le moteur local a refuse ou n'a rien rendu."""
+
+
+def audio_from(job_input: dict, name: str, backend: "Backend") -> str | None:
+    """L'audio d'une entree, en base64, quelle que soit la forme du bail.
+
+    Deux formes coexistent le temps d'une version (`ADR-010` § 6) : l'ancienne
+    porte les octets sous `audioB64` / `referenceB64`, la nouvelle porte une
+    reference et une concession sous `audio` / `reference`. L'agent les reduit
+    ici a une seule chose, et les moteurs n'en savent rien.
+
+    **Le base64 ne disparait pas, il change de longueur de fil.** Les moteurs
+    parlent JSON sur `127.0.0.1` : y encoder un WAV coute un tiers de volume
+    sur une boucle locale, ou il ne se paie pas. Ce qui coutait cher etait le
+    meme tiers sur un lien montant domestique, et c'est celui-la qui part.
+    """
+    ancien = job_input.get(name + "B64")
+    if ancien:
+        return ancien
+    reference = job_input.get(name)
+    if not reference or not reference.get("grant"):
+        return None
+    octets = backend.fetch(reference["grant"])
+    annonce = reference.get("sha256")
+    if annonce and hashlib.sha256(octets).hexdigest() != annonce:
+        # La concession a rendu autre chose que ce qu'on annoncait. Echouer
+        # ici rend le travail a la file ; le passer au moteur produirait un
+        # resultat sur la mauvaise matiere, et personne ne le verrait.
+        raise EngineError("Les octets recus ne correspondent pas a leur empreinte.")
+    return base64.b64encode(octets).decode("ascii")
 
 
 def _post_engine(client: httpx.Client, url: str, body: dict) -> httpx.Response:
@@ -353,7 +443,7 @@ def enrol_voice(
     Le profil repart vers le backend, a qui la voix appartient. Ce qui reste
     ici n'est qu'un cache, jetable : le perdre ne coute qu'un renvoi.
     """
-    reference = job_input.get("referenceB64")
+    reference = audio_from(job_input, "reference", backend)
     if not reference:
         raise EngineError("Aucun echantillon de reference dans ce travail.")
 
@@ -446,7 +536,7 @@ def enhance_audio(
     c'est ainsi qu'un meme moteur peut debruiter ici et regenerer la, sans deux
     images ni deux cles de moteur.
     """
-    audio = job_input.get("audioB64")
+    audio = audio_from(job_input, "audio", backend)
     if not audio:
         raise EngineError("Aucun audio a nettoyer dans ce travail.")
 
@@ -488,8 +578,8 @@ def transfer_performance(
     et il envoie l'echantillon d'origine — celui qu'`ADR-004` exige de garder
     precisement pour qu'un autre moteur puisse le lire.
     """
-    performance = job_input.get("audioB64")
-    reference = job_input.get("referenceB64")
+    performance = audio_from(job_input, "audio", backend)
+    reference = audio_from(job_input, "reference", backend)
     if not performance:
         raise EngineError("Aucune performance dans ce travail.")
     if not reference:
@@ -546,6 +636,36 @@ def execute(
     started = time.monotonic()
     payload = handler(client, engine, assignment.get("input") or {}, backend, config)
     payload["metrics"]["computeMs"] = int((time.monotonic() - started) * 1000)
+    return _deposit_output(payload, assignment, backend)
+
+
+def _deposit_output(payload: dict, assignment: dict, backend: "Backend") -> dict:
+    """Depose les octets produits, et ne garde qu'une reference a rendre.
+
+    Le bail dit ou deposer. S'il ne le dit pas, ce backend sert encore
+    l'ancienne forme et le resultat repart tel quel — c'est ce qui permet a cet
+    agent de parler aux deux, le temps que le deploiement rattrape.
+
+    Ce qu'un `artifactB64` porte est un profil de voix de 25 Mo : c'est le plus
+    gros objet du systeme, et celui pour lequel `ADR-010` a ete ecrit.
+    """
+    deposit = assignment.get("deposit")
+    if not deposit:
+        return payload
+
+    attempt = assignment["attempt"]
+    for cle_b64, cle_media, content_type, kind in (
+        ("audioB64", "outputMediaId", "audio/wav", "output"),
+        ("artifactB64", "artifactMediaId", "application/octet-stream", "artifact"),
+    ):
+        encode = payload.pop(cle_b64, None)
+        if not encode:
+            continue
+        octets = base64.b64decode(encode)
+        depose = backend.deposit(deposit, attempt, octets, content_type, kind)
+        payload[cle_media] = depose["mediaId"]
+        if cle_media == "outputMediaId":
+            payload["outputSha256"] = depose["sha256"]
     return payload
 
 
