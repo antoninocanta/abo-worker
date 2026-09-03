@@ -236,6 +236,30 @@ il ne le définit pas.
   le même tiers sur le lien montant. Les cinq images restent telles quelles,
   seule celle de l'agent est à reconstruire.
 
+- **Le profil de voix arrive lui aussi en concession** (0.4.0, `ABOB-137`,
+  `ADR-011`). `GET /voices/{sha256}` ne rend plus 33 Mo de base64 mais une
+  concession de quelques centaines d'octets ; l'agent la suit et va chercher le
+  `.qvoice` **directement sur le stockage**. C'est le seul transfert du projet
+  qui pèse 25 Mo, et le seul où quelqu'un attend devant l'écran.
+
+  Mesuré sur un profil réel de 25 218 963 octets, empreinte vérifiée des deux
+  côtés : **33 625 396 octets à travers le backend, contre 691**. À 7,5 Mbit/s,
+  c'est 35,9 s de lien montant qui disparaissent.
+
+  **Une porte de version distincte**, et ce n'est pas un doublon : un agent
+  `0.3.0` suit déjà une concession pour l'entrée d'un job mais lit encore
+  `voiceB64` pour un profil. Les servir par la même porte casserait toutes les
+  machines `0.3.0` en vol.
+
+  L'agent **vérifie l'empreinte** de ce qu'une concession lui rend. Une
+  concession désigne un tiers ; la suivre sans confronter le résultat à ce qu'on
+  demandait reviendrait à faire chanter au moteur une voix qu'on n'a pas
+  choisie.
+
+  **Un dépôt vers une adresse absolue ne reçoit aucun paramètre.** Une URL
+  présignée signe sa propre query : y ajouter `attempt` ou `kind` invaliderait
+  la signature, et le stockage répondrait `403` sans rien expliquer.
+
 - **L'agent attend son moteur avant de s'enrôler** (0.2.0, `ABOB-128`). Il
   interroge `/health` et exige `engine: true` ; sans cela il renonce plutôt que
   de rejoindre la ferme. S'enrôler d'abord et découvrir ensuite ferait entrer

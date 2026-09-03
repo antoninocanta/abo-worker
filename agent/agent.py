@@ -36,12 +36,20 @@ import time
 
 import httpx
 
-# 0.3.0 : l'agent suit des **concessions** au lieu de recevoir des octets
-# (`ADR-010` § 6). Le backend lit cette version pour decider laquelle des deux
-# formes il sert : une machine qui declare moins que 0.3.0 continue de recevoir
-# du base64, donc une image ancienne ne casse pas au premier travail d'un
-# utilisateur. Ne pas la baisser sans retirer le code qui va avec.
-AGENT_VERSION = "0.3.0"
+# Le backend lit cette version pour decider quelle forme de contrat il sert. Une
+# machine qui declare moins continue de recevoir l'ancienne, donc une image
+# ancienne ne casse pas au premier travail d'un utilisateur — sur une location,
+# l'heure est facturee quand meme. Ne pas la baisser sans retirer le code qui va
+# avec.
+#
+#   0.3.0  l'entree d'un job arrive en **concession** et non en octets, et le
+#          resultat se depose en octets bruts (`ADR-010` § 6, `ABOB-136`)
+#   0.4.0  le **profil de voix** arrive lui aussi en concession (`ABOB-137`).
+#          C'est le seul transfert du projet qui pese 25 Mo, et le seul ou
+#          quelqu'un attend devant l'ecran. Un depot vers une adresse absolue
+#          suit desormais la concession telle quelle, sans y ajouter de
+#          parametre : une URL presignee signe sa propre query.
+AGENT_VERSION = "0.4.0"
 
 BACKEND_URL = os.getenv("ABO_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 WORKER_KEY = os.getenv("ABO_WORKER_KEY", "")
@@ -267,14 +275,40 @@ class Backend:
         return response.json()
 
     def voice(self, sha256: str) -> str:
-        """Va chercher un profil que cette machine n'a pas encore."""
+        """Va chercher un profil que cette machine n'a pas encore.
+
+        Deux formes, et c'est le backend qui decide laquelle il sert selon la
+        version annoncee a l'enrolement (`ABOB-137`). La forme cible ne rend
+        qu'une **concession** : les 25 Mo viennent alors du stockage, sans
+        traverser le plan de controle. C'est le seul transfert du projet ou
+        quelqu'un attend devant l'ecran.
+
+        L'empreinte est **verifiee ici**. Une concession designe un tiers : la
+        suivre sans confronter ce qu'elle rend a ce qu'on demandait
+        reviendrait a faire chanter au moteur une voix qu'on n'a pas choisie.
+        """
         response = self._client.get(
             f"{self._base}/voices/{sha256}",
             headers=self._headers,
             timeout=BACKEND_TIMEOUT,
         )
         response.raise_for_status()
-        return response.json()["voiceB64"]
+        corps = response.json()
+
+        concession = corps.get("grant")
+        if not concession:
+            # Le backend sert encore l'ancienne forme. L'agent parle aux deux
+            # le temps que le deploiement rattrape.
+            return corps["voiceB64"]
+
+        octets = self.fetch(concession)
+        if hashlib.sha256(octets).hexdigest() != sha256:
+            raise EngineError(
+                "Le profil recu ne correspond pas a l'empreinte demandee."
+            )
+        # Le moteur, lui, parle JSON sur `127.0.0.1` : l'encodage revient, mais
+        # sur une boucle locale ou il ne se paie pas.
+        return base64.b64encode(octets).decode("ascii")
 
     def fetch(self, grant: dict) -> bytes:
         """Suit une concession de lecture, et rend les octets.
@@ -312,23 +346,42 @@ class Backend:
 
         Plus de base64 sur ce chemin : c'est le tiers de volume qu'il coutait,
         et il n'achetait rien qu'un corps JSON.
+
+        **Une adresse absolue ne recoit aucun parametre.** Une URL presignee
+        signe sa propre query : y ajouter `attempt` ou `kind` invaliderait la
+        signature, et le stockage repondrait `403` sans rien expliquer. Ces
+        deux valeurs ne servent qu'a notre API, qui frappe l'identite en
+        recevant ; quand un tiers ecrit, l'identite est deja frappee et voyage
+        dans la concession.
         """
         url = grant["url"]
         headers = dict(grant.get("headers") or {})
-        if url.startswith("/"):
+        direct = not url.startswith("/")
+        if not direct:
             url = BACKEND_URL + url
             headers.update(self._headers)
-        headers["Content-Type"] = content_type
+        headers.setdefault("Content-Type", content_type)
+
         response = self._client.request(
             grant.get("method", "POST"),
             url,
-            params={"attempt": attempt, "kind": kind},
+            params=None if direct else {"attempt": attempt, "kind": kind},
             content=payload,
             headers=headers,
             timeout=BACKEND_TIMEOUT,
         )
         response.raise_for_status()
-        return response.json()
+        if not direct:
+            return response.json()
+
+        # Le stockage ne rend pas de JSON : la reference est celle que la
+        # concession portait deja, et l'empreinte se calcule ici. Le backend la
+        # reverifiera de son cote — il ne croit pas la machine sur parole.
+        return {
+            "mediaId": grant["mediaId"],
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "sizeBytes": len(payload),
+        }
 
     def result(self, job_id: str, attempt: int, payload: dict) -> None:
         response = self._post(f"/jobs/{job_id}/result", {**payload, "attempt": attempt})
