@@ -49,7 +49,11 @@ import httpx
 #          quelqu'un attend devant l'ecran. Un depot vers une adresse absolue
 #          suit desormais la concession telle quelle, sans y ajouter de
 #          parametre : une URL presignee signe sa propre query.
-AGENT_VERSION = "0.4.0"
+#   0.5.0  la concession de depot se **demande quand les octets existent**
+#          (`ADR-013`, `ABOB-147`), en annoncant nature, taille et empreinte.
+#          Sans ca, une seule concession sert deux natures : un `.qvoice`
+#          atterrirait dans le stockage de travail avec un TTL de 14 jours.
+AGENT_VERSION = "0.5.0"
 
 BACKEND_URL = os.getenv("ABO_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 WORKER_KEY = os.getenv("ABO_WORKER_KEY", "")
@@ -333,6 +337,41 @@ class Backend:
         )
         response.raise_for_status()
         return response.content
+
+    def deposit_grant(
+        self,
+        job_id: str,
+        attempt: int,
+        kind: str,
+        payload: bytes,
+        content_type: str,
+    ) -> dict | None:
+        """Demande de quoi deposer ce qu'on vient de produire (`ADR-013`).
+
+        On annonce ce qu'on a — nature, taille, empreinte — et le backend rend
+        une concession qui **porte ces contraintes signees**. Le stockage les
+        oppose ensuite lui-meme : d'autres octets, ou une autre longueur, sont
+        refuses a l'ecriture.
+
+        `None` quand la route n'existe pas : ce backend est anterieur a la
+        decision, et l'appelant retombera sur ce qu'il sait faire. Un `404` est
+        donc une reponse, pas une panne — et c'est le seul code qu'on traite
+        ainsi, pour ne pas confondre « pas cette version » avec « refuse ».
+        """
+        response = self._post(
+            f"/jobs/{job_id}/media/grant",
+            {
+                "attempt": attempt,
+                "kind": kind,
+                "sizeBytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "contentType": content_type,
+            },
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
 
     def deposit(
         self,
@@ -695,18 +734,26 @@ def execute(
 def _deposit_output(payload: dict, assignment: dict, backend: "Backend") -> dict:
     """Depose les octets produits, et ne garde qu'une reference a rendre.
 
-    Le bail dit ou deposer. S'il ne le dit pas, ce backend sert encore
-    l'ancienne forme et le resultat repart tel quel — c'est ce qui permet a cet
-    agent de parler aux deux, le temps que le deploiement rattrape.
+    **La concession se demande quand les octets existent** (`ADR-013`). C'est ce
+    qui permet au backend de ranger un `.qvoice` dans le durable et une prise
+    dans le travail : au moment du bail, personne ne sait encore lequel des deux
+    ce travail produira. Une seule concession pour les deux natures ferait
+    atterrir un profil de voix dans un stockage temporaire.
+
+    Trois formes coexistent, et l'agent choisit d'apres ce que le backend lui
+    donne, jamais d'apres sa propre version :
+
+    - le bail porte une concession — un backend d'avant `ADR-013`, on s'en sert ;
+    - il n'en porte pas et la route de concession repond — la forme cible ;
+    - il n'en porte pas et la route n'existe pas — un backend d'avant
+      `ADR-010`, et le resultat repart en base64 comme autrefois.
 
     Ce qu'un `artifactB64` porte est un profil de voix de 25 Mo : c'est le plus
     gros objet du systeme, et celui pour lequel `ADR-010` a ete ecrit.
     """
-    deposit = assignment.get("deposit")
-    if not deposit:
-        return payload
-
     attempt = assignment["attempt"]
+    du_bail = assignment.get("deposit")
+
     for cle_b64, cle_media, content_type, kind in (
         ("audioB64", "outputMediaId", "audio/wav", "output"),
         ("artifactB64", "artifactMediaId", "application/octet-stream", "artifact"),
@@ -715,7 +762,17 @@ def _deposit_output(payload: dict, assignment: dict, backend: "Backend") -> dict
         if not encode:
             continue
         octets = base64.b64decode(encode)
-        depose = backend.deposit(deposit, attempt, octets, content_type, kind)
+
+        concession = du_bail or backend.deposit_grant(
+            assignment["jobId"], attempt, kind, octets, content_type
+        )
+        if concession is None:
+            # Ce backend ne sait recevoir aucun depot : on lui rend les octets
+            # sous la forme qu'il comprend plutot que de perdre le travail.
+            payload[cle_b64] = encode
+            continue
+
+        depose = backend.deposit(concession, attempt, octets, content_type, kind)
         payload[cle_media] = depose["mediaId"]
         if cle_media == "outputMediaId":
             payload["outputSha256"] = depose["sha256"]

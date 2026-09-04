@@ -43,10 +43,16 @@ services:
     # l'ancienne image sans que rien ne le signale, et ca coute une location de
     # GPU pour rien. Le tag reste devant pour qu'on sache lire ce qu'on epingle.
     #
-    # 0.4.0 : le profil de voix arrive en concession (`ABOB-137`). Une machine
-    # tiree d'une image anterieure fonctionne toujours — le backend lui sert
-    # l'ancienne forme — mais elle repaie 33 Mo a chaque defaut de cache.
-    image: antoninocanta/abo-worker-agent:0.4.0@sha256:368bd41fb6253d66c5e513840818fd5e9a42fcb8b555ca0fca4bd99ad3e3110e
+    # 0.5.0 : la concession de depot se demande **quand les octets existent**
+    # (`ADR-013`), ce qui donne a chaque nature sa propre finalite. Avec une
+    # concession unique frappee au bail, un `.qvoice` partait dans le stockage
+    # de travail et disparaissait au bout de quatorze jours.
+    # 0.4.0 : le profil de voix arrive en concession (`ABOB-137`).
+    #
+    # Une machine tiree d'une image anterieure fonctionne toujours — le backend
+    # lui sert l'ancienne forme — mais elle repaie 33 Mo a chaque defaut de
+    # cache, et son depot reste borne a une seule finalite.
+    image: antoninocanta/abo-worker-agent:0.5.0@sha256:3eb8ca2b669fe78ed21d2bd3bdbf435e0c2d2426f4c8bceeda24ceeb94996909
     restart: unless-stopped
     environment:
       ABO_BACKEND_URL: ${ABO_BACKEND_URL:-https://api.abo.example}
