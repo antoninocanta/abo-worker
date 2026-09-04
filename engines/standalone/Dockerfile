@@ -39,3 +39,23 @@ RUN chmod +x /opt/abo/entrypoint.sh
 # l'entrypoint.
 ENTRYPOINT ["/opt/abo/entrypoint.sh"]
 CMD []
+
+# ATTENTION — **un hebergeur peut ignorer cet `ENTRYPOINT`.**
+#
+# Vast le remplace en `runtype: args`. Le conteneur demarre, la console annonce
+# `success, running <image>`, et l'agent n'existe pas : aucun appel n'arrive et
+# rien ne dit pourquoi. La machine tourne et se paie.
+#
+# Celui qui loue doit donc passer le chemin ci-dessus dans `onstart`, et c'est
+# ce que fait `app/compute/vast.py` d'`abo-backend` depuis `ABOB-155`. Deux
+# details qui ont coute cinq locations le 04/09 :
+#
+#   - `onstart` est un **argv**, pas une ligne de shell : `exec /opt/...` fait
+#     chercher un fichier portant ce nom entier ;
+#   - pour savoir si cet entrypoint tourne vraiment, raccourcir l'attente de
+#     l'agent (`ABO_AGENT_ENGINE_READY_TIMEOUT=60`). S'il est vivant, il
+#     abandonne en une minute et le conteneur meurt. S'il reste `running`, c'est
+#     qu'il n'a jamais demarre.
+#
+# Deplacer ce chemin casse donc le lancement chez l'hebergeur, pas seulement
+# ici : il fait partie du contrat de l'image.
