@@ -74,7 +74,22 @@ services:
       # rejouer une authentification a chaque redemarrage.
       - mesh_state:/var/lib/tailscale
     environment:
-      ABO_BACKEND_URL: ${ABO_BACKEND_URL:-https://api.abo.example}
+      # **Deux adresses, et la distinction n'est pas cosmetique** (`ABOB-157`).
+      #
+      # Le travail passe par le maillage et par lui seul : la surface machine
+      # d'ABO n'est plus servie par le tunnel public, donc cette adresse-ci est
+      # une adresse de maillage — `http://100.x.y.z:8080`, le port 8080 du
+      # noeud `abo-backend`.
+      ABO_BACKEND_URL: ${ABO_BACKEND_URL:-http://abo-backend:8080}
+      # Le tunnel public, et pour **une seule chose** : faire remonter l'URL de
+      # validation du maillage a la console. Au moment ou cette URL existe,
+      # cette machine n'a pas d'adresse de maillage — c'est la definition de
+      # l'enrolement. Il faut une porte avant la porte.
+      #
+      # Cet appel n'accorde rien : aucun bail, aucun credential, aucune
+      # concession d'ecriture. Le laisser vide n'empeche pas l'enrolement, il
+      # remet juste l'URL dans le seul journal du conteneur.
+      ABO_BACKEND_PUBLIC_URL: ${ABO_BACKEND_PUBLIC_URL:-}
       ABO_WORKER_KEY: ${ABO_WORKER_KEY:?identifiant de machine requis}
       ABO_WORKER_SECRET: ${ABO_WORKER_SECRET:?secret d enrolement requis}
       # **Aucune cle d'enrolement.** L'enrolement est manuel, une fois par

@@ -69,6 +69,31 @@ NOM_NOEUD="abo-$(printf '%s' "${ABO_WORKER_KEY:-sans-cle}" | tr '_' '-' | tr -cd
 
 adresse() { ts ip -4 2>/dev/null | head -n 1; }
 
+# Le compte Tailscale qui a valide ce noeud, ou rien s'il n'est pas encore
+# lisible. **Il ne l'est qu'une fois le demon `Running`** : au premier
+# enrolement il l'est deja, parce que `tailscale up` a attendu la validation ;
+# a la reprise depuis l'etat, l'adresse revient du volume avant que la table
+# des comptes soit peuplee. Rendre vide dans ce cas est la bonne reponse — c'est
+# a l'appelant de decider s'il attend ou s'il refuse.
+compte_de_validation() {
+    ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    etat = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if etat.get("BackendState") != "Running":
+    sys.exit(0)
+moi = (etat.get("Self") or {}).get("UserID")
+utilisateur = (etat.get("User") or {}).get(str(moi)) or {}
+print(utilisateur.get("LoginName", ""))
+' 2>/dev/null || true
+}
+
+# Rempli plus bas, et declare ici pour que `set -u` ne morde pas sur le chemin
+# ou aucun controle de compte n'est demande.
+COMPTE=""
+
 if [ -n "$(adresse)" ]; then
     echo "abo-entrypoint: deja enrole, etat repris du volume"
 else
@@ -82,8 +107,42 @@ else
     # console de maillage ne se revoque pas, faute de savoir lequel c'est.
     echo "abo-entrypoint: premiere connexion au maillage — validation manuelle attendue"
     echo "abo-entrypoint: ============================================================"
-    ts up --accept-dns=false --hostname="$NOM_NOEUD" --timeout="${LOGIN_MAX}s" 2>&1 &
+    # La sortie va dans un fichier **et** dans ce journal. Le fichier sert a en
+    # extraire l'URL ; le journal reste le chemin qui marche toujours, y compris
+    # quand la console est injoignable. Un `| tee` ne conviendrait pas : `$!`
+    # rendrait le pid de `tee`, et on surveillerait le mauvais processus.
+    JOURNAL_LOGIN=$(mktemp)
+    ts up --accept-dns=false --hostname="$NOM_NOEUD" --timeout="${LOGIN_MAX}s" \
+        > "$JOURNAL_LOGIN" 2>&1 &
     LOGIN_PID=$!
+    tail -f "$JOURNAL_LOGIN" &
+    ECHO_PID=$!
+
+    # --- Faire remonter l'URL a la console ABO (`ABOB-157`) ------------------
+    #
+    # C'est le seul appel que cette machine passe **hors** du maillage, et il ne
+    # peut pas etre autrement : au moment ou l'URL existe, la machine n'a pas
+    # d'adresse. Il va donc a la surface publique, et il n'accorde rien.
+    #
+    # `grep` sur le fichier plutot qu'un motif dans la sortie : l'URL parait en
+    # une seconde ou deux, bien avant la validation humaine.
+    URL_LOGIN=""
+    attendu=0
+    while [ -z "$URL_LOGIN" ] && [ "$attendu" -lt 30 ]; do
+        URL_LOGIN=$(grep -om1 'https://login\.tailscale\.com/[A-Za-z0-9/_.-]*' \
+            "$JOURNAL_LOGIN" 2>/dev/null || true)
+        [ -n "$URL_LOGIN" ] && break
+        kill -0 "$LOGIN_PID" 2>/dev/null || break
+        attendu=$((attendu + 1))
+        sleep 1
+    done
+    if [ -n "$URL_LOGIN" ]; then
+        # `|| true` : une remontee qui echoue ne doit pas coûter la machine.
+        # L'URL est dans le journal, qui etait le seul chemin jusqu'ici.
+        python3 /srv/mesh_announce.py announce "$URL_LOGIN" "$NOM_NOEUD" || true
+    else
+        echo "abo-entrypoint: aucune URL de login reperee — voir ce journal" >&2
+    fi
 
     # `tailscale up` ecrit l'URL puis attend. On surveille l'adresse plutot que
     # la sortie du processus : c'est l'obtention d'une adresse qui prouve
@@ -92,6 +151,9 @@ else
     while [ -z "$(adresse)" ]; do
         attendu=$((attendu + 5))
         if [ "$attendu" -ge "$LOGIN_MAX" ]; then
+            python3 /srv/mesh_announce.py failed \
+                "aucune validation en ${LOGIN_MAX}s" || true
+            kill "$ECHO_PID" 2>/dev/null || true
             echec "aucune validation en ${LOGIN_MAX}s.
   L'URL de login est plus haut dans ce journal. La rejouer :
     docker compose logs agent | grep login.tailscale.com
@@ -101,10 +163,15 @@ else
         sleep 5
     done
     wait "$LOGIN_PID" 2>/dev/null || true
+    kill "$ECHO_PID" 2>/dev/null || true
+    rm -f "$JOURNAL_LOGIN"
     echo "abo-entrypoint: ============================================================"
 fi
 
 ADRESSE=$(adresse)
+if [ -z "$ADRESSE" ]; then
+    python3 /srv/mesh_announce.py failed "aucune adresse de maillage obtenue" || true
+fi
 [ -n "$ADRESSE" ] || echec "aucune adresse de maillage obtenue.
   **La raison exacte est dans les lignes que tailscale vient d'ecrire au-dessus**
   — un nom de noeud invalide, une validation refusee ou expiree echouent toutes
@@ -134,32 +201,24 @@ if [ -n "${ABO_TAILSCALE_EXPECTED_ACCOUNT:-}" ]; then
     #
     # On attend donc, puis on **refuse**. Un controle qui ne tourne pas vaut
     # moins que pas de controle : il fait croire qu'il a tourne.
-    COMPTE=""
     attendu=0
     while [ "$attendu" -lt "${ABO_MESH_ACCOUNT_TIMEOUT:-30}" ]; do
-        COMPTE=$(ts status --json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    etat = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-if etat.get("BackendState") != "Running":
-    sys.exit(0)
-moi = (etat.get("Self") or {}).get("UserID")
-utilisateur = (etat.get("User") or {}).get(str(moi)) or {}
-print(utilisateur.get("LoginName", ""))
-' 2>/dev/null || true)
+        COMPTE=$(compte_de_validation)
         [ -n "$COMPTE" ] && break
         attendu=$((attendu + 2))
         sleep 2
     done
 
     if [ -z "$COMPTE" ]; then
+        python3 /srv/mesh_announce.py failed \
+            "compte de validation illisible apres ${attendu}s" || true
         echec "compte de validation illisible apres ${attendu}s.
   Le controle ABO_TAILSCALE_EXPECTED_ACCOUNT ne peut pas s'effectuer, et le
   laisser passer ferait croire qu'il a tourne. Relancer, ou retirer la variable
   si le controle n'est pas voulu."
     elif [ "$COMPTE" != "$ABO_TAILSCALE_EXPECTED_ACCOUNT" ]; then
+        python3 /srv/mesh_announce.py failed \
+            "valide par « ${COMPTE} », attendu « ${ABO_TAILSCALE_EXPECTED_ACCOUNT} »" || true
         echec "ce noeud a ete valide par « ${COMPTE} », attendu « ${ABO_TAILSCALE_EXPECTED_ACCOUNT} ».
   Le maillage est le perimetre de confiance de la ferme : un noeud dans le
   mauvais tailnet n'est pas un detail de configuration.
@@ -168,9 +227,21 @@ print(utilisateur.get("LoginName", ""))
     else
         echo "abo-entrypoint: valide par ${COMPTE}"
     fi
+else
+    # Sans controle demande, une **seule** lecture et pas de boucle : le compte
+    # n'est plus qu'une information pour la console, et faire attendre trente
+    # secondes une machine qui n'a rien demande serait payer un confort au prix
+    # d'un demarrage.
+    COMPTE=$(compte_de_validation)
 fi
 
 echo "abo-entrypoint: sur le maillage, adresse ${ADRESSE}"
+
+# La console peut cesser d'afficher « en attente » (`ABOB-157`). Sans demande en
+# attente, le backend repond `NOTHING_PENDING` et ne fabrique rien : c'est ce
+# qui permet de l'appeler a chaque demarrage, y compris quand rien ne s'est
+# enrole. Et si l'annonce precedente s'etait perdue, celle-ci la rattrape.
+python3 /srv/mesh_announce.py settled "$ADRESSE" "$COMPTE" || true
 
 # L'agent la lira pour n'ecouter que la (`ABOB-158`). Aujourd'hui il n'ecoute
 # sur rien, et la variable est deja juste : c'est ce qui evitera d'inventer une

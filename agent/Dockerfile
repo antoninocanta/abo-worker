@@ -49,6 +49,10 @@ WORKDIR /srv
 RUN pip install --no-cache-dir "httpx>=0.27,<1"
 
 COPY agent.py .
+# La remontee de l'URL de validation a la console (`ABOB-157`). Un module a
+# part, et pas quelques lignes dans l'entrypoint : c'est le seul appel que cette
+# machine passe hors du maillage, il merite d'etre lisible et il se teste.
+COPY mesh_announce.py .
 COPY entrypoint.sh /usr/local/bin/abo-entrypoint
 RUN chmod +x /usr/local/bin/abo-entrypoint
 
