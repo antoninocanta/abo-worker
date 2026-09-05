@@ -54,10 +54,42 @@ services:
     # cache, et son depot reste borne a une seule finalite.
     image: antoninocanta/abo-worker-agent:0.5.0@sha256:3eb8ca2b669fe78ed21d2bd3bdbf435e0c2d2426f4c8bceeda24ceeb94996909
     restart: unless-stopped
+    # --- Le maillage, condition d'existence d'un worker (`ADR-015` § 1) -------
+    #
+    # Mode **noyau**, arbitre par Onin le 05/09. C'est ce qui rend ces trois
+    # lignes obligatoires — et c'est aussi ce qui preserve l'installation en une
+    # passe : le device et les capacites se **declarent** ici, personne ne
+    # touche a l'hote.
+    #
+    # `NET_ADMIN` pour creer l'interface, `NET_RAW` pour les regles de
+    # filtrage que tailscaled pose lui-meme. Sans elles il demarre et ne route
+    # rien, ce qui est le pire des cas : un worker qui parait sain.
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      # L'etat du noeud. Un noeud ephemere s'en passe, mais le garder evite de
+      # rejouer une authentification a chaque redemarrage.
+      - mesh_state:/var/lib/tailscale
     environment:
       ABO_BACKEND_URL: ${ABO_BACKEND_URL:-https://api.abo.example}
       ABO_WORKER_KEY: ${ABO_WORKER_KEY:?identifiant de machine requis}
       ABO_WORKER_SECRET: ${ABO_WORKER_SECRET:?secret d enrolement requis}
+      # Cle d'enrolement au maillage. **Reutilisable, ephemere et taguee** :
+      # reutilisable pour n'avoir aucun secret par machine a distribuer,
+      # ephemere pour qu'un noeud eteint disparaisse tout seul — ce qui evite la
+      # collection de noeuds morts que la ferme a deja sur les workers `LOST` —
+      # et taguee pour que les ACL portent sur le tag et non sur des machines
+      # nommees une a une. Recette dans documentation/exploitation.md.
+      #
+      # Requise au **premier** demarrage seulement : ensuite l'etat du noeud
+      # suffit, et l'entrypoint le sait.
+      ABO_TAILSCALE_AUTHKEY: ${ABO_TAILSCALE_AUTHKEY:-}
+      # Facultatif : un tailnet auto-heberge (Headscale) plutot que Tailscale.
+      ABO_TAILSCALE_LOGIN_SERVER: ${ABO_TAILSCALE_LOGIN_SERVER:-}
+      ABO_TAILSCALE_TAGS: ${ABO_TAILSCALE_TAGS:-}
       # Les moteurs portes, declares au backend a l'enrolement :
       #   engineKey|modelKey|versionNumber|url[|mode]
       # Le backend confronte cette declaration a son registre de modeles : un
@@ -205,3 +237,7 @@ services:
 
 volumes:
   voice_cache:
+  # L'identite du noeud de maillage de cette machine. Un volume nomme et pas un
+  # bind mount : Docker recopie le contenu de l'image dans un volume nomme vide,
+  # la ou un bind mount masquerait — piege deja paye sur les poids des moteurs.
+  mesh_state:

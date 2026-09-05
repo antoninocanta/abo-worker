@@ -67,7 +67,14 @@ import httpx
 #          vers une capacite louee a cote d'un moteur local, et le backend le
 #          sait enfin : sans ce champ il rangeait tout en local et un differe
 #          pouvait partir sur une capacite facturee a l'appel.
-AGENT_VERSION = "0.7.0"
+#   0.8.0  **le conteneur embarque son noeud de maillage** (`ADR-015` § 1,
+#          `ABOB-156`). Il refuse de lancer l'agent sans adresse de maillage :
+#          une machine hors maillage n'est pas un worker degrade, elle n'est pas
+#          un worker. Exige `/dev/net/tun`, `NET_ADMIN` et `NET_RAW`, declares
+#          dans le compose. Le numero le dit parce qu'un operateur qui lit
+#          `agent_version` dans la console doit savoir si cette machine est sur
+#          le maillage ou pas.
+AGENT_VERSION = "0.8.0"
 
 BACKEND_URL = os.getenv("ABO_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 WORKER_KEY = os.getenv("ABO_WORKER_KEY", "")
