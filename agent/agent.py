@@ -818,6 +818,7 @@ class Backend:
         size_bytes: int,
         sha256: str,
         content_type: str,
+        fallback_reason: str = "",
     ) -> dict | None:
         """La meme concession, **sans tenir les octets** (`ADR-016` § 4).
 
@@ -835,6 +836,10 @@ class Backend:
                 "sizeBytes": size_bytes,
                 "sha256": sha256,
                 "contentType": content_type,
+                # Pourquoi on passe par ici alors qu'on sait signer. Le backend
+                # le compte : sans motif, le repli pourrait redevenir la route
+                # normale sans que personne le voie (`ADR-017`).
+                "fallbackReason": fallback_reason,
             },
         )
         if response.status_code == 404:
@@ -1155,6 +1160,29 @@ def _rendu(response: httpx.Response) -> dict:
     return corps if isinstance(corps, dict) else {}
 
 
+# --- Le repli, borne et jamais silencieux (`ADR-017`) ------------------------
+#
+# Il existe pour ne pas perdre de travail, et c'est la seule raison. **Il ne doit
+# jamais devenir la route normale sans qu'on le voie** : chaque cause est nommee,
+# criee en avertissement, et transmise au backend qui la compte. Une cause qu'on
+# ne saurait pas nommer n'en est pas une — on ne replie pas dessus.
+REPLI_SANS_CREDENTIALS = "no-credentials"
+REPLI_SANS_CRENEAU = "no-output-slot"
+REPLI_CONCESSION_RELATIVE = "relative-grant"
+REPLI_SANS_CONCESSION = "no-grant"
+REPLI_MOTEUR_ANCIEN = "engine-without-deferred-output"
+
+
+def _crie_le_repli(motif: str, job_id: str) -> None:
+    """Un avertissement, jamais une info.
+
+    Le niveau **est** la decision : un `info` se noie dans un journal de
+    production, et le jour ou le repli redeviendrait la route normale personne
+    ne le verrait avant une facture de bande passante.
+    """
+    logger.warning("repli sur la concession par media : %s (job=%s)", motif, job_id)
+
+
 def _concession_de_depot(
     backend: "Backend",
     creneau: dict | None,
@@ -1184,10 +1212,13 @@ def _concession_de_depot(
         if vault is not None:
             url, entetes = vault.presign_put(str(creneau["objectKey"]), taille, empreinte)
             return {"url": url, "headers": entetes, "mediaId": creneau["mediaId"]}
-        logger.info("creneau recu sans credentials, repli sur la concession par media")
+        motif = REPLI_SANS_CREDENTIALS
+    else:
+        motif = REPLI_SANS_CRENEAU
 
+    _crie_le_repli(motif, job_id)
     return backend.deposit_grant_for(
-        job_id, attempt, kind, taille, empreinte, content_type
+        job_id, attempt, kind, taille, empreinte, content_type, fallback_reason=motif
     )
 
 
@@ -1242,17 +1273,18 @@ def deposited_elsewhere(
             # Le moteur a repondu la forme directe : il est anterieur a
             # `ADR-016`. On le dit plutot que de deviner, et l'appelant rejoue
             # en base64 avec l'image qui tourne.
-            logger.info("moteur sans sortie differee, repli sur les octets")
+            _crie_le_repli(REPLI_MOTEUR_ANCIEN, job_id)
             return None
 
         concession = _concession_de_depot(
             backend, creneau, job_id, attempt, kind, taille, empreinte, content_type
         )
         if concession is None:
+            _crie_le_repli(REPLI_SANS_CONCESSION, job_id)
             return None
         adresse = str(concession.get("url") or "")
         if not adresse.startswith("https://"):
-            logger.info("concession non absolue, repli sur les octets")
+            _crie_le_repli(REPLI_CONCESSION_RELATIVE, job_id)
             return None
 
         depot = session.post(

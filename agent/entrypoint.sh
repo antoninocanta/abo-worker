@@ -124,18 +124,41 @@ ADRESSE=$(adresse)
 # personne ne lit laisserait tourner une machine mal placee. Le controle est
 # facultatif — sans la variable, rien n'est verifie.
 if [ -n "${ABO_TAILSCALE_EXPECTED_ACCOUNT:-}" ]; then
-    COMPTE=$(ts status --json 2>/dev/null | python3 -c '
+    # **Le compte n'est lisible qu'une fois le demon `Running`.** Au premier
+    # enrolement il l'est deja, parce que `tailscale up` a attendu la
+    # validation ; **a la reprise depuis l'etat, non** — l'adresse revient du
+    # volume avant que la table des comptes soit peuplee. La premiere version
+    # de ce controle tombait donc dans cette course et annoncait « controle non
+    # effectue », c'est-a-dire une degradation silencieuse : exactement ce que
+    # ce controle existe pour ne pas etre.
+    #
+    # On attend donc, puis on **refuse**. Un controle qui ne tourne pas vaut
+    # moins que pas de controle : il fait croire qu'il a tourne.
+    COMPTE=""
+    attendu=0
+    while [ "$attendu" -lt "${ABO_MESH_ACCOUNT_TIMEOUT:-30}" ]; do
+        COMPTE=$(ts status --json 2>/dev/null | python3 -c '
 import json, sys
 try:
     etat = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
+if etat.get("BackendState") != "Running":
+    sys.exit(0)
 moi = (etat.get("Self") or {}).get("UserID")
 utilisateur = (etat.get("User") or {}).get(str(moi)) or {}
 print(utilisateur.get("LoginName", ""))
 ' 2>/dev/null || true)
+        [ -n "$COMPTE" ] && break
+        attendu=$((attendu + 2))
+        sleep 2
+    done
+
     if [ -z "$COMPTE" ]; then
-        echo "abo-entrypoint: compte de validation illisible, controle non effectue" >&2
+        echec "compte de validation illisible apres ${attendu}s.
+  Le controle ABO_TAILSCALE_EXPECTED_ACCOUNT ne peut pas s'effectuer, et le
+  laisser passer ferait croire qu'il a tourne. Relancer, ou retirer la variable
+  si le controle n'est pas voulu."
     elif [ "$COMPTE" != "$ABO_TAILSCALE_EXPECTED_ACCOUNT" ]; then
         echec "ce noeud a ete valide par « ${COMPTE} », attendu « ${ABO_TAILSCALE_EXPECTED_ACCOUNT} ».
   Le maillage est le perimetre de confiance de la ferme : un noeud dans le

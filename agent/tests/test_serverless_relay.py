@@ -307,10 +307,16 @@ class _BackendWithoutStorage:
 class _BackendAvecConcession(_BackendWithoutStorage):
     def __init__(self, concession=None):
         self.demandes = []
+        # Le motif de chaque repli. Il doit **toujours** etre renseigne : un
+        # repli sans cause nommee est ce qu'`ADR-017` interdit.
+        self.motifs = []
         self._concession = CONCESSION if concession is None else concession
 
-    def deposit_grant_for(self, job_id, attempt, kind, size_bytes, sha256, content_type):
+    def deposit_grant_for(
+        self, job_id, attempt, kind, size_bytes, sha256, content_type, fallback_reason=""
+    ):
         self.demandes.append((job_id, attempt, kind, size_bytes, sha256, content_type))
+        self.motifs.append(fallback_reason)
         return self._concession
 
 

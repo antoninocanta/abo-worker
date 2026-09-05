@@ -14,6 +14,7 @@ forme ; la mesure tient l'accord.
 """
 import base64
 import hashlib
+import logging
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlsplit
 
@@ -106,6 +107,35 @@ def test_un_jeu_proche_de_son_echeance_n_est_plus_utilisable():
     assert _coffre(reste=timedelta(hours=6)).usable is True
     assert _coffre(reste=timedelta(minutes=5)).usable is False
     assert _coffre(reste=timedelta(minutes=-1)).usable is False
+
+
+def test_chaque_repli_nomme_sa_cause_et_la_crie(caplog):
+    """Un repli sans cause nommee est ce qu'`ADR-017` interdit.
+
+    Le niveau **est** la decision : un `info` se noie dans un journal de
+    production, et le jour ou le repli redeviendrait la route normale personne
+    ne le verrait avant une facture de bande passante. Le motif part aussi au
+    backend, qui le compte — un journal local ne suffit pas a voir une derive.
+    """
+    motifs = {
+        agent.REPLI_SANS_CREDENTIALS,
+        agent.REPLI_SANS_CRENEAU,
+        agent.REPLI_CONCESSION_RELATIVE,
+        agent.REPLI_SANS_CONCESSION,
+        agent.REPLI_MOTEUR_ANCIEN,
+    }
+    # Cinq causes distinctes : deux qui se confondraient masqueraient l'une.
+    assert len(motifs) == 5
+    assert all(motif and motif.strip() == motif for motif in motifs)
+
+    with caplog.at_level(logging.WARNING, logger="abo.agent"):
+        agent._crie_le_repli(agent.REPLI_SANS_CREDENTIALS, "job-1")
+
+    assert caplog.records, "le repli n'a rien journalise"
+    enregistrement = caplog.records[-1]
+    assert enregistrement.levelno == logging.WARNING
+    assert agent.REPLI_SANS_CREDENTIALS in enregistrement.getMessage()
+    assert "job-1" in enregistrement.getMessage()
 
 
 def test_deux_signatures_du_meme_objet_different_par_leur_contenu():
