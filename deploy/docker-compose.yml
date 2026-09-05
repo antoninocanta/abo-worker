@@ -59,9 +59,28 @@ services:
       ABO_WORKER_KEY: ${ABO_WORKER_KEY:?identifiant de machine requis}
       ABO_WORKER_SECRET: ${ABO_WORKER_SECRET:?secret d enrolement requis}
       # Les moteurs portes, declares au backend a l'enrolement :
-      #   engineKey|modelKey|versionNumber|url
+      #   engineKey|modelKey|versionNumber|url[|mode]
       # Le backend confronte cette declaration a son registre de modeles : un
       # moteur qu'il ne connait pas est refuse, pas ignore.
+      #
+      # Le cinquieme champ est le **mode d'execution de cette capacite-la** —
+      # `LOCAL_GPU`, `LOCAL_CPU` ou `PROXY` (`ADR-016` § 1). Il appartient a la
+      # capacite et non a la machine : une seule machine peut donc melanger,
+      # et c'est le cas courant plutot qu'un cas limite.
+      #
+      #   ABO_ENGINES=chatterbox|voice.chatterbox|1|vast+serverless://ep/convert|PROXY,
+      #               deepfilternet|audio.deepfilternet|1|http://deepfilternet:18100|LOCAL_CPU
+      #
+      # Optionnel, et les defauts ne mentent pas : une adresse
+      # `vast+serverless://` **est** un `PROXY`, l'agent le deduit et refuse de
+      # se declarer autrement. Sans precision, un moteur local est `LOCAL_GPU`.
+      # Le poser sert donc a nommer un `LOCAL_CPU`, qui est un niveau de service
+      # et non un GPU au rabais — et c'est lui qui donne au differe sa matiere
+      # premiere.
+      #
+      # **Le mode gouverne le placement** : un travail differe ne part jamais
+      # sur une capacite `PROXY`, parce qu'il a ete vendu moitie prix contre de
+      # la patience et qu'une capacite facturee a l'appel inverse l'economie.
       ABO_ENGINES: ${ABO_ENGINES:-qwen3_tts|voice.qwen3-tts|1|http://qwen3-tts:18100}
       # L'agent vit dans son propre conteneur et ne voit pas la carte du moteur.
       # La declarer sert au placement, jamais a accorder un droit.

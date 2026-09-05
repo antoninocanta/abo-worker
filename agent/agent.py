@@ -20,6 +20,8 @@ Configuration, par l'environnement :
                          `engineKey|modelKey|versionNumber|url`
     ABO_WORKER_GPU       carte declaree, quand l'agent ne peut pas la voir
                          lui-meme (il tourne dans son propre conteneur)
+    ABO_VAST_API_KEY     cle du compte Vast, requise uniquement par un relais
+                         dont une URL moteur commence par vast+serverless://
     ABO_AGENT_ENGINE_READY_TIMEOUT
                          combien de temps un moteur a pour devenir servable
                          avant que l'agent renonce a rejoindre la ferme
@@ -30,9 +32,13 @@ import logging
 import os
 import platform
 import shutil
+import ssl
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
+from dataclasses import dataclass
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -53,13 +59,28 @@ import httpx
 #          (`ADR-013`, `ABOB-147`), en annoncant nature, taille et empreinte.
 #          Sans ca, une seule concession sert deux natures : un `.qvoice`
 #          atterrirait dans le stockage de travail avec un TTL de 14 jours.
-AGENT_VERSION = "0.5.0"
+#   0.6.0  un agent de confiance peut relayer les deux operations sans etat
+#          vers Vast **apres** avoir recu un bail ABO normal (`ABOB-133`).
+#   0.7.0  chaque capacite declare **ou elle calcule** — `LOCAL_GPU`,
+#          `LOCAL_CPU` ou `PROXY` (`ADR-016` § 1, `ABOB-163`). Cinquieme champ
+#          optionnel d'`ABO_ENGINES`. Une machine peut donc porter un `PROXY`
+#          vers une capacite louee a cote d'un moteur local, et le backend le
+#          sait enfin : sans ce champ il rangeait tout en local et un differe
+#          pouvait partir sur une capacite facturee a l'appel.
+AGENT_VERSION = "0.7.0"
 
 BACKEND_URL = os.getenv("ABO_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 WORKER_KEY = os.getenv("ABO_WORKER_KEY", "")
 WORKER_SECRET = os.getenv("ABO_WORKER_SECRET", "")
 ENGINES_SPEC = os.getenv("ABO_ENGINES", "")
 DECLARED_GPU = os.getenv("ABO_WORKER_GPU", "")
+VAST_API_KEY = os.getenv("ABO_VAST_API_KEY", "")
+VAST_CONSOLE_URL = os.getenv("ABO_VAST_CONSOLE_URL", "https://console.vast.ai").rstrip(
+    "/"
+)
+VAST_SERVERLESS_URL = os.getenv(
+    "ABO_VAST_SERVERLESS_URL", "https://run.vast.ai"
+).rstrip("/")
 
 # Un intervalle court fait vivre le mode Creation : l'utilisateur attend devant
 # son ecran, et deux secondes de sondage s'ajoutent a chaque segment. Un bail
@@ -76,6 +97,16 @@ BACKEND_TIMEOUT = float(os.getenv("ABO_AGENT_BACKEND_TIMEOUT", "120"))
 # partage son disque avec le telechargement de l'image voisine.
 ENGINE_READY_TIMEOUT = float(os.getenv("ABO_AGENT_ENGINE_READY_TIMEOUT", "600"))
 ENGINE_READY_POLL_SECONDS = float(os.getenv("ABO_AGENT_ENGINE_READY_POLL", "3"))
+# Le bail ABO vaut dix minutes. Le routeur n'en consomme au plus que la moitie,
+# afin qu'un worker froid garde encore le temps de calculer et de rendre.
+VAST_ROUTE_TIMEOUT = float(os.getenv("ABO_VAST_ROUTE_TIMEOUT", "300"))
+VAST_ROUTE_POLL_SECONDS = float(os.getenv("ABO_VAST_ROUTE_POLL_SECONDS", "2"))
+
+STATELESS_OPERATIONS = frozenset({"AUDIO_ENHANCE", "PERFORMANCE_TRANSFER"})
+SERVERLESS_ROUTE_BY_OPERATION = {
+    "AUDIO_ENHANCE": "/enhance",
+    "PERFORMANCE_TRANSFER": "/convert",
+}
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout
@@ -83,48 +114,276 @@ logging.basicConfig(
 logger = logging.getLogger("abo.agent")
 
 
-class Engine:
-    """Un moteur local, et la version de modele ABO qu'il sert."""
+LOCAL_MODES = ("LOCAL_GPU", "LOCAL_CPU")
+EXECUTION_MODES = (*LOCAL_MODES, "PROXY")
 
-    def __init__(self, engine_key: str, model_key: str, version_number: int, url: str) -> None:
+
+class Engine:
+    """Un moteur, la version de modele ABO qu'il sert, et **ou il calcule**.
+
+    Le mode d'execution appartient a la capacite et non a la machine
+    (`ADR-016` § 1) : cet agent peut porter un `PROXY` vers une capacite louee
+    a cote d'un `LOCAL_CPU` qui calcule sur place. C'est exactement ce que
+    `ABO_ENGINES` decrivait deja sans savoir le dire — une entree par moteur,
+    chacune avec sa propre adresse.
+    """
+
+    def __init__(
+        self,
+        engine_key: str,
+        model_key: str,
+        version_number: int,
+        url: str,
+        mode: str | None = None,
+    ) -> None:
         self.engine_key = engine_key
         self.model_key = model_key
         self.version_number = version_number
         self.url = url.rstrip("/")
+        self.serverless_endpoint: str | None = None
+        self.serverless_route: str | None = None
+
+        if self.url.startswith("vast+serverless://"):
+            parsed = urlsplit(self.url)
+            endpoint = unquote(parsed.netloc).strip()
+            route = parsed.path
+            if (
+                not endpoint
+                or not route.startswith("/")
+                or route == "/"
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise SystemExit(
+                    "Moteur Vast mal forme : "
+                    "vast+serverless://<endpoint>/<route> est attendu."
+                )
+            self.serverless_endpoint = endpoint
+            self.serverless_route = route
+
+        # **Le mode n'est pas libre de contredire l'adresse.** Une adresse
+        # serverless est un `PROXY`, c'est un fait et non une preference ; et un
+        # moteur qu'on joint dans son propre compose n'en est pas un. Declarer
+        # l'inverse ferait entrer dans la ferme une machine dont la politique de
+        # placement est fausse — un differe partirait sur une capacite facturee
+        # a l'appel, ce que `specs/16` interdit.
+        declared = (mode or "").strip().upper() or None
+        if declared is not None and declared not in EXECUTION_MODES:
+            raise SystemExit(
+                f"Mode d'execution inconnu : « {mode} ». "
+                "Attendu : " + ", ".join(EXECUTION_MODES)
+            )
+        if self.is_serverless:
+            if declared is not None and declared != "PROXY":
+                raise SystemExit(
+                    f"« {engine_key} » vise une capacite louee et se declare "
+                    f"{declared} : une adresse serverless est un PROXY."
+                )
+            self.mode = "PROXY"
+        else:
+            if declared == "PROXY":
+                raise SystemExit(
+                    f"« {engine_key} » se declare PROXY sur une adresse locale. "
+                    "Un PROXY pilote une capacite externe."
+                )
+            # Sans precision, le moteur est local et sur carte : c'est ce que
+            # toute la ferme sert aujourd'hui, et le placement ne distingue de
+            # toute facon que « local » de « facture a l'appel ».
+            self.mode = declared or "LOCAL_GPU"
+
+    @property
+    def is_serverless(self) -> bool:
+        return self.serverless_endpoint is not None
 
     def declaration(self) -> dict:
         return {
             "engineKey": self.engine_key,
             "modelKey": self.model_key,
             "versionNumber": self.version_number,
+            "executionMode": self.mode,
         }
 
 
 def parse_engines(spec: str) -> list[Engine]:
-    """`engineKey|modelKey|versionNumber|url`, separes par des virgules.
+    """`engineKey|modelKey|versionNumber|url[|mode]`, separes par des virgules.
 
     Un moteur mal decrit arrete l'agent au demarrage. Se declarer a moitie
     reviendrait a rejoindre la ferme en promettant une capacite qu'on ne sert
     pas, et l'erreur ne se verrait qu'au premier job d'un utilisateur.
+
+    Le cinquieme champ est le **mode d'execution** de cette capacite-la
+    (`ADR-016` § 1). Il est optionnel : une adresse serverless donne `PROXY`
+    d'elle-meme, et un moteur local sans precision est `LOCAL_GPU` — ce que
+    sert la ferme d'aujourd'hui. Le poser sert a nommer un `LOCAL_CPU`, qui est
+    un niveau de service et non un GPU au rabais.
     """
     engines: list[Engine] = []
     for entry in (part.strip() for part in spec.split(",")):
         if not entry:
             continue
         fields = [field.strip() for field in entry.split("|")]
-        if len(fields) != 4 or not all(fields):
+        if len(fields) not in (4, 5) or not all(fields):
             raise SystemExit(
                 f"ABO_ENGINES mal forme : « {entry} ». "
-                "Attendu : engineKey|modelKey|versionNumber|url"
+                "Attendu : engineKey|modelKey|versionNumber|url[|mode]"
             )
-        engine_key, model_key, version, url = fields
+        engine_key, model_key, version, url = fields[:4]
+        mode = fields[4] if len(fields) == 5 else None
         if not version.isdigit():
             raise SystemExit(f"Numero de version invalide dans « {entry} ».")
-        engines.append(Engine(engine_key, model_key, int(version), url))
+        engines.append(Engine(engine_key, model_key, int(version), url, mode))
 
     if not engines:
         raise SystemExit("ABO_ENGINES est vide : cette machine n'a rien a servir.")
     return engines
+
+
+@dataclass(frozen=True)
+class VastEndpoint:
+    """Le nom routable et le secret propre a un endpoint Vast."""
+
+    name: str
+    api_key: str
+
+
+class VastServerlessRelay:
+    """Transport Vast du relais, sans aucune decision d'ordonnancement ABO.
+
+    L'agent n'arrive ici qu'apres avoir recu un bail normal du backend. Il
+    hydrate alors les petits medias du job, demande un worker au routeur Vast,
+    puis lui transmet une seule operation sans etat.
+    """
+
+    def __init__(self, client: httpx.Client, api_key: str = VAST_API_KEY) -> None:
+        if not api_key:
+            raise SystemExit("ABO_VAST_API_KEY est requis par un moteur serverless.")
+        self._client = client
+        self._api_key = api_key
+        self._endpoints: dict[str, VastEndpoint] | None = None
+        self._tls_client: httpx.Client | None = None
+
+    @staticmethod
+    def _auth(api_key: str) -> dict[str, str]:
+        return {"Authorization": "Bearer " + api_key}
+
+    def _load_endpoints(self) -> dict[str, VastEndpoint]:
+        if self._endpoints is not None:
+            return self._endpoints
+        response = self._client.get(
+            VAST_CONSOLE_URL + "/api/v0/endptjobs/",
+            headers=self._auth(self._api_key),
+            params={"client_id": "me", "api_key": self._api_key},
+            timeout=BACKEND_TIMEOUT,
+        )
+        if response.status_code != 200:
+            raise EngineError(
+                f"Vast refuse la liste des endpoints ({response.status_code})."
+            )
+        try:
+            rows = response.json().get("results", []) or []
+        except (AttributeError, ValueError) as failure:
+            raise EngineError("Vast a rendu une liste d'endpoints illisible.") from failure
+
+        endpoints: dict[str, VastEndpoint] = {}
+        for row in rows:
+            config = row.get("config") or {}
+            name = str(row.get("endpoint_name") or config.get("endpoint_name") or "")
+            endpoint_key = row.get("api_key")
+            if not name or not endpoint_key:
+                continue
+            endpoint = VastEndpoint(name=name, api_key=str(endpoint_key))
+            endpoints[name] = endpoint
+            if row.get("id") is not None:
+                endpoints[str(row["id"])] = endpoint
+        self._endpoints = endpoints
+        return endpoints
+
+    def endpoint(self, engine: Engine) -> VastEndpoint:
+        endpoint = self._load_endpoints().get(engine.serverless_endpoint or "")
+        if endpoint is None:
+            raise EngineError(
+                f"Endpoint Vast inconnu : {engine.serverless_endpoint or '?'}"
+            )
+        return endpoint
+
+    def validate(self, engines: list[Engine]) -> None:
+        """Refuse l'enrolement si une capacite annoncee n'existe pas chez Vast."""
+        for engine in engines:
+            endpoint = self.endpoint(engine)
+            logger.info(
+                "endpoint Vast pret : %s -> %s%s",
+                engine.engine_key,
+                endpoint.name,
+                engine.serverless_route,
+            )
+
+    def _worker_client(self, worker_url: str) -> httpx.Client:
+        if not worker_url.casefold().startswith("https://"):
+            return self._client
+        if self._tls_client is None:
+            certificate = self._client.get(
+                VAST_CONSOLE_URL + "/static/jvastai_root.cer",
+                timeout=BACKEND_TIMEOUT,
+            )
+            certificate.raise_for_status()
+            context = ssl.create_default_context()
+            try:
+                context.load_verify_locations(cadata=certificate.text)
+            except ssl.SSLError as failure:
+                raise EngineError("Certificat de worker Vast illisible.") from failure
+            self._tls_client = httpx.Client(verify=context)
+        return self._tls_client
+
+    def post(self, engine: Engine, payload: dict) -> httpx.Response:
+        endpoint = self.endpoint(engine)
+        request_idx = 0
+        deadline = time.monotonic() + VAST_ROUTE_TIMEOUT
+
+        while True:
+            response = self._client.post(
+                VAST_SERVERLESS_URL + "/route/",
+                headers=self._auth(endpoint.api_key),
+                params={"api_key": endpoint.api_key},
+                json={
+                    "endpoint": endpoint.name,
+                    "api_key": endpoint.api_key,
+                    "cost": 100,
+                    "request_idx": request_idx,
+                    "replay_timeout": VAST_ROUTE_TIMEOUT,
+                },
+                timeout=BACKEND_TIMEOUT,
+            )
+            if response.status_code != 200:
+                raise EngineError(
+                    f"Routeur Vast indisponible ({response.status_code})."
+                )
+            try:
+                route = response.json()
+            except ValueError as failure:
+                raise EngineError("Routeur Vast illisible.") from failure
+
+            request_idx = int(
+                route.get("request_idx") or route.get("reqnum") or request_idx
+            )
+            worker_url = route.get("url")
+            if worker_url:
+                break
+            if time.monotonic() >= deadline:
+                raise EngineError("Aucun worker Vast disponible avant l'expiration du bail.")
+            time.sleep(VAST_ROUTE_POLL_SECONDS)
+
+        client = self._worker_client(str(worker_url))
+        return client.post(
+            str(worker_url).rstrip("/") + (engine.serverless_route or ""),
+            headers=self._auth(endpoint.api_key),
+            params={"api_key": endpoint.api_key},
+            json={"auth_data": route, "session_id": None, "payload": payload},
+            timeout=ENGINE_TIMEOUT,
+        )
+
+    def close(self) -> None:
+        if self._tls_client is not None:
+            self._tls_client.close()
 
 
 def hardware() -> dict:
@@ -469,8 +728,18 @@ def audio_from(job_input: dict, name: str, backend: "Backend") -> str | None:
     return base64.b64encode(octets).decode("ascii")
 
 
-def _post_engine(client: httpx.Client, url: str, body: dict) -> httpx.Response:
-    return client.post(url, json=body, timeout=ENGINE_TIMEOUT)
+def _post_engine(
+    client: httpx.Client,
+    engine: Engine,
+    route: str,
+    body: dict,
+    relay: VastServerlessRelay | None,
+) -> httpx.Response:
+    if engine.is_serverless:
+        if relay is None:
+            raise EngineError("Transport Vast absent pour ce moteur serverless.")
+        return relay.post(engine, body)
+    return client.post(engine.url + route, json=body, timeout=ENGINE_TIMEOUT)
 
 
 def synthesize(
@@ -479,6 +748,7 @@ def synthesize(
     job_input: dict,
     backend: "Backend",
     config: dict,
+    relay: VastServerlessRelay | None,
 ) -> dict:
     """Texte -> WAV. Le profil de voix appartient au backend, pas a la machine.
 
@@ -496,13 +766,13 @@ def synthesize(
         "voice_sha256": job_input.get("voiceSha256", "") or "",
     }
 
-    response = _post_engine(client, f"{engine.url}/synthesize", body)
+    response = _post_engine(client, engine, "/synthesize", body, relay)
     if response.status_code == 409 and body["voice_sha256"]:
         # Le chemin lent, et il doit le rester : une fois par machine et par
         # voix. Le profil ne devient pas durable ici, il alimente un cache.
         logger.info("profil absent du cache, recuperation : %s", body["voice_sha256"][:12])
         body["voice_b64"] = backend.voice(body["voice_sha256"])
-        response = _post_engine(client, f"{engine.url}/synthesize", body)
+        response = _post_engine(client, engine, "/synthesize", body, relay)
 
     if response.status_code != 200:
         raise EngineError(f"{response.status_code} {response.text[:300]}")
@@ -529,6 +799,7 @@ def enrol_voice(
     job_input: dict,
     backend: "Backend",
     config: dict,
+    relay: VastServerlessRelay | None,
 ) -> dict:
     """Echantillon + transcription -> profil de voix.
 
@@ -541,13 +812,15 @@ def enrol_voice(
 
     response = _post_engine(
         client,
-        f"{engine.url}/enroll",
+        engine,
+        "/enroll",
         {
             "reference_b64": reference,
             "voice_name": job_input.get("voiceName", "voix"),
             "language": job_input.get("language", "French"),
             "reference_text": job_input.get("referenceText", "") or "",
         },
+        relay,
     )
     if response.status_code != 200:
         raise EngineError(f"{response.status_code} {response.text[:300]}")
@@ -571,6 +844,7 @@ def design_voice(
     job_input: dict,
     backend: "Backend",
     config: dict,
+    relay: VastServerlessRelay | None,
 ) -> dict:
     """Description ecrite -> extrait audio d'une voix inventee.
 
@@ -584,12 +858,14 @@ def design_voice(
 
     response = _post_engine(
         client,
-        f"{engine.url}/design",
+        engine,
+        "/design",
         {
             "description": description,
             "text": job_input.get("text", ""),
             "language": job_input.get("language", "French"),
         },
+        relay,
     )
     if response.status_code == 501:
         # L'image ne porte pas les poids VoiceDesign. C'est une machine mal
@@ -615,6 +891,7 @@ def enhance_audio(
     job_input: dict,
     backend: "Backend",
     config: dict,
+    relay: VastServerlessRelay | None,
 ) -> dict:
     """Une prise bruitee -> la meme prise, nettoyee.
 
@@ -633,7 +910,11 @@ def enhance_audio(
         raise EngineError("Aucun audio a nettoyer dans ce travail.")
 
     response = _post_engine(
-        client, f"{engine.url}/enhance", {"audio_b64": audio, "config": config}
+        client,
+        engine,
+        "/enhance",
+        {"audio_b64": audio, "config": config},
+        relay,
     )
     if response.status_code != 200:
         raise EngineError(f"{response.status_code} {response.text[:300]}")
@@ -658,6 +939,7 @@ def transfer_performance(
     job_input: dict,
     backend: "Backend",
     config: dict,
+    relay: VastServerlessRelay | None,
 ) -> dict:
     """Le jeu d'une prise, le timbre d'une autre.
 
@@ -679,8 +961,10 @@ def transfer_performance(
 
     response = _post_engine(
         client,
-        f"{engine.url}/convert",
+        engine,
+        "/convert",
         {"audio_b64": performance, "reference_b64": reference, "config": config},
+        relay,
     )
     if response.status_code != 200:
         raise EngineError(f"{response.status_code} {response.text[:300]}")
@@ -709,7 +993,11 @@ HANDLERS = {
 
 
 def execute(
-    client: httpx.Client, engines: dict[str, Engine], assignment: dict, backend: "Backend"
+    client: httpx.Client,
+    engines: dict[str, Engine],
+    assignment: dict,
+    backend: "Backend",
+    relay: VastServerlessRelay | None = None,
 ) -> dict:
     engine = engines.get(assignment["engineKey"])
     if engine is None:
@@ -717,7 +1005,19 @@ def execute(
         # porte pas : sa declaration et sa realite ont diverge.
         raise EngineError(f"Moteur non porte : {assignment['engineKey']}")
 
-    handler = HANDLERS.get(assignment["operation"])
+    operation = assignment["operation"]
+    if engine.is_serverless and operation not in STATELESS_OPERATIONS:
+        # Cette borne est locale et volontairement redondante avec le registre.
+        # Une route mal configuree ne doit jamais faire transiter un profil de
+        # voix durable par un worker serverless non epingle.
+        raise EngineError(f"Operation avec etat interdite au relais Vast : {operation}")
+    expected_route = SERVERLESS_ROUTE_BY_OPERATION.get(operation)
+    if engine.is_serverless and engine.serverless_route != expected_route:
+        raise EngineError(
+            f"Route Vast incoherente pour {operation} : {engine.serverless_route}"
+        )
+
+    handler = HANDLERS.get(operation)
     if handler is None:
         raise EngineError(f"Operation non servie par cet agent : {assignment['operation']}")
 
@@ -726,7 +1026,14 @@ def execute(
     config = assignment.get("engineConfig") or {}
 
     started = time.monotonic()
-    payload = handler(client, engine, assignment.get("input") or {}, backend, config)
+    payload = handler(
+        client,
+        engine,
+        assignment.get("input") or {},
+        backend,
+        config,
+        relay,
+    )
     payload["metrics"]["computeMs"] = int((time.monotonic() - started) * 1000)
     return _deposit_output(payload, assignment, backend)
 
@@ -792,12 +1099,25 @@ def run() -> None:
         ", ".join(f"{e.engine_key}@{e.model_key}v{e.version_number}" for e in engines),
     )
 
-    with httpx.Client() as client:
+    with ExitStack() as stack:
+        client = stack.enter_context(httpx.Client())
         backend = Backend(client)
+        serverless_engines = [engine for engine in engines if engine.is_serverless]
+        local_engines = [engine for engine in engines if not engine.is_serverless]
+        relay = None
+        if serverless_engines:
+            relay = VastServerlessRelay(client)
+            stack.callback(relay.close)
+            try:
+                relay.validate(serverless_engines)
+            except (EngineError, httpx.HTTPError) as failure:
+                raise SystemExit(
+                    f"Capacite Vast serverless invalide : {failure}"
+                ) from failure
         # Les moteurs d'abord, la ferme ensuite. L'ordre est le sujet
         # d'`ABOB-128` : declarer une capacite avant de l'avoir est une panne
         # qu'on fait decouvrir a un utilisateur.
-        wait_for_engines(client, engines)
+        wait_for_engines(client, local_engines)
         backend.enrol(engines)
 
         last_heartbeat = 0.0
@@ -815,7 +1135,7 @@ def run() -> None:
                         # redeclarer sans verifier la remettrait en ligne
                         # exactement aussi cassee qu'avant.
                         logger.info("redeclaration demandee")
-                        wait_for_engines(client, engines)
+                        wait_for_engines(client, local_engines)
                         backend.enrol(engines)
 
                 assignment = backend.lease()
@@ -834,7 +1154,7 @@ def run() -> None:
                     attempt,
                 )
                 try:
-                    payload = execute(client, by_key, assignment, backend)
+                    payload = execute(client, by_key, assignment, backend, relay)
                 except (EngineError, httpx.HTTPError) as failure:
                     # Un travail qu'on ne sait pas faire se rend tout de suite :
                     # le backend le retentera ailleurs sans attendre le bail.

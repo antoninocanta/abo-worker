@@ -1,0 +1,25 @@
+# Relais de confiance pour les seules operations sans etat (`ABOB-133`).
+#
+# Ce processus est un worker ABO normal : il s'enrole, tire un bail, hydrate
+# ses entrees, puis seulement demande un executant au routeur serverless Vast.
+# Il ne provisionne aucune instance et reste distinct du gateway de fournisseur.
+#
+# Son identite doit etre creee `RENTED`, puisque chaque execution qu'elle
+# represente est facturee chez Vast. Le scheduler exclut ainsi le niveau
+# differe de ce chemin.
+services:
+  vast-relay:
+    build: ../agent
+    restart: unless-stopped
+    environment:
+      ABO_BACKEND_URL: ${ABO_BACKEND_URL:-https://api.abo.example}
+      ABO_WORKER_KEY: ${ABO_VAST_RELAY_WORKER_KEY:?identifiant du relais requis}
+      ABO_WORKER_SECRET: ${ABO_VAST_RELAY_WORKER_SECRET:?secret du relais requis}
+      ABO_VAST_API_KEY: ${ABO_VAST_API_KEY:?cle Vast requise}
+      # Exemple :
+      # clearervoice|audio.clearervoice|1|vast+serverless://Clearer%20Voice/enhance,
+      # chatterbox|voice.chatterbox|1|vast+serverless://Follow%20My%20Lead/convert
+      ABO_ENGINES: ${ABO_VAST_RELAY_ENGINES:?endpoints Vast requis}
+      ABO_WORKER_GPU: vast-serverless
+      ABO_VAST_ROUTE_TIMEOUT: ${ABO_VAST_ROUTE_TIMEOUT:-300}
+      ABO_VAST_ROUTE_POLL_SECONDS: ${ABO_VAST_ROUTE_POLL_SECONDS:-2}
