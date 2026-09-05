@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -299,6 +300,9 @@ class _BackendWithoutStorage:
     def deposit_grant_for(self, *args, **kwargs):
         return None
 
+    def vault(self):
+        return None
+
 
 class _BackendAvecConcession(_BackendWithoutStorage):
     def __init__(self, concession=None):
@@ -570,6 +574,86 @@ def test_une_concession_qu_on_ne_peut_pas_confier_retombe_sur_les_octets(grant):
     assert envoye["audio_b64"] == base64.b64encode(b"source").decode()
     assert backend.fetches == [grant]
     assert relay.appels_session[1][0] == "/upload"
+
+
+PREFIXE_COFFRE = "workers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/"
+
+
+class _BackendQuiSigneLuiMeme(_BackendAvecConcession):
+    """Un backend qui sert des credentials, donc que l'agent n'a plus a solliciter.
+
+    `demandes` doit rester **vide** : c'est tout l'objet d'`ADR-017`, plus aucun
+    aller-retour de plan de controle par media.
+    """
+
+    def vault(self):
+        return agent.Vault(
+            access_key_id="AK",
+            secret_access_key="SK",
+            session_token="JETON",
+            prefix=PREFIXE_COFFRE,
+            expires_at=datetime.now(UTC) + timedelta(hours=6),
+            bucket="abo-work",
+            endpoint_url="https://" + "a" * 32 + ".r2.cloudflarestorage.com",
+            region="auto",
+        )
+
+
+def test_avec_un_creneau_et_des_credentials_l_agent_signe_et_n_appelle_personne():
+    """Le coeur d'`ADR-017` : le plan de controle quitte le chemin d'ecriture.
+
+    La cle vient du bail, la signature vient de la machine, et le backend n'est
+    sollicite pour rien entre les deux.
+    """
+    relay = _RelayResult()
+    backend = _BackendQuiSigneLuiMeme()
+    assignation = _assignation({"audioB64": base64.b64encode(b"source").decode()})
+    assignation["outputSlot"] = {
+        "mediaId": "media-du-bail",
+        "objectKey": PREFIXE_COFFRE + "job-1/1/output.wav",
+    }
+
+    with httpx.Client() as client:
+        resultat = agent.execute(
+            client, {"clearervoice": _engine()}, assignation, backend, relay
+        )
+
+    assert backend.demandes == [], "une concession a ete demandee au backend"
+    route, depot = relay.appels_session[1]
+    assert route == "/upload"
+    assert depot["put_url"].startswith(
+        "https://" + "a" * 32 + ".r2.cloudflarestorage.com/abo-work/" + PREFIXE_COFFRE
+    )
+    assert "X-Amz-Signature=" in depot["put_url"]
+    # La taille et l'empreinte annoncees par le moteur, signees dans l'URL.
+    assert depot["headers"]["content-length"] == str(len(SORTIE))
+    assert resultat["outputMediaId"] == "media-du-bail"
+    assert resultat["outputSha256"] == SHA_SORTIE
+
+
+def test_un_creneau_sans_credentials_retombe_sur_la_concession_du_backend():
+    """Trois cas reels amenent ici, et perdre le travail serait pire que l'appel.
+
+    Un deploiement sans jeton d'API Cloudflare, une machine drainee dont les
+    credentials sont taris, un agent plus recent que son backend. Le repli n'est
+    donc pas une tiedeur : c'est ce qui rend la nouveaute sans risque.
+    """
+    relay = _RelayResult()
+    backend = _BackendAvecConcession()  # pas de `vault`, il rend `None`
+    assignation = _assignation({"audioB64": base64.b64encode(b"source").decode()})
+    assignation["outputSlot"] = {
+        "mediaId": "media-du-bail",
+        "objectKey": PREFIXE_COFFRE + "job-1/1/output.wav",
+    }
+
+    with httpx.Client() as client:
+        resultat = agent.execute(
+            client, {"clearervoice": _engine()}, assignation, backend, relay
+        )
+
+    assert backend.demandes, "le repli n'a pas demande de concession"
+    assert relay.appels_session[1][1]["put_url"] == CONCESSION["url"]
+    assert resultat["outputMediaId"] == "media-1"
 
 
 def test_un_moteur_local_recoit_toujours_les_octets():

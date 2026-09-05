@@ -28,6 +28,7 @@ Configuration, par l'environnement :
 """
 import base64
 import hashlib
+import hmac
 import logging
 import os
 import platform
@@ -38,7 +39,8 @@ import sys
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
-from urllib.parse import unquote, urlsplit
+from datetime import UTC, datetime, timedelta
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -82,7 +84,13 @@ import httpx
 #          chez Vast. Repli complet sur le base64 quand la concession n'est pas
 #          confiable — un chemin qui echouerait en silence serait pire que son
 #          absence.
-AGENT_VERSION = "0.9.0"
+#   0.10.0 la machine **signe elle-meme** ses depots (`ADR-017`). Elle demande un
+#          jeu de credentials R2 temporaires bornes a `workers/<id>/`, le garde
+#          en memoire, le renouvelle avant echeance, et signe les concessions
+#          qu'elle confie a une capacite louee. Plus aucun aller-retour de plan
+#          de controle par media. La version compte : le bail ne porte de creneau
+#          de sortie qu'a partir d'ici.
+AGENT_VERSION = "0.10.0"
 
 BACKEND_URL = os.getenv("ABO_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 WORKER_KEY = os.getenv("ABO_WORKER_KEY", "")
@@ -630,6 +638,10 @@ class Backend:
         self._client = client
         self._base = f"{BACKEND_URL}/v1/workers/{WORKER_KEY}"
         self._headers = {"X-Worker-Secret": WORKER_SECRET}
+        # Les credentials R2 de cette machine, gardes **en memoire seulement**.
+        # Rien sur disque : un secret de douze heures ecrit quelque part est un
+        # secret a effacer, et un conteneur qui redemarre en redemande un.
+        self._vault: Vault | None = None
 
     def _post(self, path: str, payload: dict) -> httpx.Response:
         return self._client.post(
@@ -760,6 +772,43 @@ class Backend:
             hashlib.sha256(payload).hexdigest(),
             content_type,
         )
+
+    def vault(self) -> "Vault | None":
+        """Les credentials R2 de cette machine, frappes ou renouveles au besoin.
+
+        **C'est ici que le renouvellement vit**, et nulle part ailleurs : le
+        demander a chaque usage avec une marge est plus simple qu'une horloge de
+        fond, et ca ne coute un appel qu'une ou deux fois par jour.
+
+        `None` quand ce deploiement ne frappe pas de credentials — l'appelant
+        retombe alors sur la concession par media (`ADR-016` § 4), qui reste
+        correcte et coute un aller-retour. Un `503` est donc une **reponse**,
+        pas une panne, exactement comme le `404` de `deposit_grant`.
+        """
+        if self._vault is not None and self._vault.usable:
+            return self._vault
+
+        response = self._post("/credentials", {})
+        if response.status_code in (404, 503):
+            logger.info("pas de credentials R2 servis, repli sur la concession par media")
+            self._vault = None
+            return None
+        if response.status_code == 409:
+            # Drainee ou revoquee : elle n'a plus a ecrire, et le backend a
+            # raison de le refuser. Le travail en cours se rendra par l'autre
+            # chemin plutot que d'echouer.
+            logger.warning("credentials refuses : %s", response.text[:200])
+            self._vault = None
+            return None
+        response.raise_for_status()
+
+        self._vault = Vault.depuis(response.json())
+        logger.info(
+            "credentials R2 obtenus, prefixe %s, echeance %s",
+            self._vault.prefix,
+            self._vault.expires_at.isoformat(),
+        )
+        return self._vault
 
     def deposit_grant_for(
         self,
@@ -948,6 +997,148 @@ def audio_fields(
     return {name + "_b64": octets} if octets else {}
 
 
+# --- Signer ses propres depots (`ADR-017`) -----------------------------------
+#
+# **Ce signeur est un doublon de celui du backend**, et il faut le dire : les
+# deux depots n'ont aucun paquet commun, et l'agent n'a que `httpx`. Le risque
+# est qu'ils divergent ; ce qui le borne est que SigV4 ne bouge pas, et que R2
+# refuse tout ce qui s'en ecarte — une divergence rend `403`, jamais un silence.
+ALGORITHME = "AWS4-HMAC-SHA256"
+CHARGE_NON_SIGNEE = "UNSIGNED-PAYLOAD"
+# Un caractere non reserve dans une query s'encode ; la barre oblique aussi,
+# contrairement a un chemin. Les confondre coute une signature fausse et un
+# `403` que rien n'explique — piege deja paye cote backend.
+NON_RESERVE_QUERY = "-._~"
+NON_RESERVE_CHEMIN = "-._~/"
+# On redemande un jeu quand il reste moins que ca : signer avec des credentials
+# qui expirent pendant le televersement rendrait un `403` au milieu d'un depot.
+MARGE_RENOUVELLEMENT = timedelta(minutes=20)
+
+
+def _hmac(cle: bytes, message: str) -> bytes:
+    return hmac.new(cle, message.encode("utf-8"), hashlib.sha256).digest()
+
+
+@dataclass
+class Vault:
+    """Les credentials R2 de cette machine, et de quoi signer avec.
+
+    Bornes a `workers/<worker_id>/` et a quelques heures. Ils ne quittent jamais
+    cette machine : ce qui part vers une capacite louee est une **URL signee**,
+    un objet, un verbe, une duree courte.
+    """
+
+    access_key_id: str
+    secret_access_key: str
+    session_token: str
+    prefix: str
+    expires_at: datetime
+    bucket: str
+    endpoint_url: str
+    region: str
+
+    @classmethod
+    def depuis(cls, corps: dict) -> "Vault":
+        return cls(
+            access_key_id=corps["accessKeyId"],
+            secret_access_key=corps["secretAccessKey"],
+            session_token=corps["sessionToken"],
+            prefix=corps["prefix"],
+            expires_at=datetime.fromisoformat(corps["expiresAt"]),
+            bucket=corps["bucket"],
+            endpoint_url=corps["endpointUrl"].rstrip("/"),
+            region=corps.get("region") or "auto",
+        )
+
+    @property
+    def usable(self) -> bool:
+        return datetime.now(UTC) + MARGE_RENOUVELLEMENT < self.expires_at
+
+    def _cle_de_signature(self, jour: str) -> bytes:
+        cle = _hmac(("AWS4" + self.secret_access_key).encode("utf-8"), jour)
+        cle = _hmac(cle, self.region)
+        cle = _hmac(cle, "s3")
+        return _hmac(cle, "aws4_request")
+
+    def presign_put(self, object_key: str, size_bytes: int, sha256: str, ttl: int = 900):
+        """Une concession d'ecriture pour **cet objet-la**, et rien d'autre.
+
+        La taille et l'empreinte sont **signees**, donc opposees par R2 :
+        d'autres octets ou une autre longueur sont refuses a l'ecriture
+        (`ADR-011`, et `400 BadDigest` mesure). C'est ce qui permet de confier
+        cette URL a une capacite louee sans lui confier quoi que ce soit
+        d'autre.
+
+        L'echeance est **bornee par celle du jeu**. Une URL signee plus
+        longtemps que les credentials qui la signent promettrait une duree que
+        personne ne tiendrait.
+        """
+        if not object_key.startswith(self.prefix):
+            # Se le refuser ici plutot que de laisser R2 rendre `403` : le
+            # message serait « Access Denied », et personne ne verrait que la
+            # cle etait hors du prefixe de cette machine.
+            raise EngineError(
+                f"Cle hors du prefixe de cette machine : {object_key} (attendu {self.prefix}…)"
+            )
+
+        restant = int((self.expires_at - datetime.now(UTC)).total_seconds())
+        expire_dans = max(60, min(ttl, restant))
+
+        maintenant = datetime.now(UTC)
+        horodate = maintenant.strftime("%Y%m%dT%H%M%SZ")
+        jour = maintenant.strftime("%Y%m%d")
+        portee = f"{jour}/{self.region}/s3/aws4_request"
+
+        hote = urlsplit(self.endpoint_url).netloc
+        chemin = "/" + self.bucket + "/" + quote(object_key, safe=NON_RESERVE_CHEMIN)
+
+        signables = {
+            "host": hote,
+            "content-length": str(size_bytes),
+            "x-amz-checksum-sha256": base64.b64encode(bytes.fromhex(sha256)).decode("ascii"),
+        }
+        liste_signee = ";".join(sorted(signables))
+        entetes_canoniques = "".join(f"{nom}:{signables[nom]}\n" for nom in sorted(signables))
+
+        query = {
+            "X-Amz-Algorithm": ALGORITHME,
+            "X-Amz-Credential": f"{self.access_key_id}/{portee}",
+            "X-Amz-Date": horodate,
+            "X-Amz-Expires": str(expire_dans),
+            "X-Amz-Security-Token": self.session_token,
+            "X-Amz-SignedHeaders": liste_signee,
+        }
+        query_canonique = "&".join(
+            f"{quote(nom, safe=NON_RESERVE_QUERY)}={quote(valeur, safe=NON_RESERVE_QUERY)}"
+            for nom, valeur in sorted(query.items())
+        )
+        # Un `join` et pas une f-string, malgre ce que suggere le linter : cette
+        # forme doit se lire **exactement comme celle du backend**, parce que
+        # les deux signent la meme chose et qu'une divergence de lecture est le
+        # premier pas vers une divergence de comportement. Et le `\n` final
+        # d'`entetes_canoniques` produit la ligne vide que SigV4 exige — visible
+        # ici, invisible dans une f-string.
+        requete_canonique = "\n".join(  # noqa: FLY002
+            ["PUT", chemin, query_canonique, entetes_canoniques, liste_signee, CHARGE_NON_SIGNEE]
+        )
+        a_signer = "\n".join(
+            [
+                ALGORITHME,
+                horodate,
+                portee,
+                hashlib.sha256(requete_canonique.encode("utf-8")).hexdigest(),
+            ]
+        )
+        signature = hmac.new(
+            self._cle_de_signature(jour), a_signer.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+        url = f"{self.endpoint_url}{chemin}?{query_canonique}&X-Amz-Signature={signature}"
+        # `host` n'est pas rendu : le porteur le pose lui-meme.
+        joints = {nom: valeur for nom, valeur in signables.items() if nom != "host"}
+        return url, joints
+
+
 def _rendu(response: httpx.Response) -> dict:
     """La charge d'une reponse de moteur, enveloppee ou non.
 
@@ -964,6 +1155,42 @@ def _rendu(response: httpx.Response) -> dict:
     return corps if isinstance(corps, dict) else {}
 
 
+def _concession_de_depot(
+    backend: "Backend",
+    creneau: dict | None,
+    job_id: str,
+    attempt: int,
+    kind: str,
+    taille: int,
+    empreinte: str,
+    content_type: str,
+) -> dict | None:
+    """De quoi deposer, signe **ici** quand c'est possible (`ADR-017`).
+
+    Deux chemins, et le premier est celui qui ne coute aucun aller-retour :
+
+    - le bail portait un **creneau** — une ligne de media et sa cle, deja
+      frappees sous le prefixe de cette machine — et on a des credentials : on
+      signe soi-meme. Le plan de controle n'est pas dans le chemin d'ecriture ;
+    - sinon on demande au backend (`ADR-016` § 4), qui reste correct.
+
+    Le repli n'est pas une tiedeur : un deploiement sans jeton d'API Cloudflare,
+    une machine drainee, un agent plus recent que son backend — les trois
+    arrivent, et perdre le travail pour l'un d'eux serait pire que l'appel
+    qu'on economise.
+    """
+    if creneau:
+        vault = backend.vault()
+        if vault is not None:
+            url, entetes = vault.presign_put(str(creneau["objectKey"]), taille, empreinte)
+            return {"url": url, "headers": entetes, "mediaId": creneau["mediaId"]}
+        logger.info("creneau recu sans credentials, repli sur la concession par media")
+
+    return backend.deposit_grant_for(
+        job_id, attempt, kind, taille, empreinte, content_type
+    )
+
+
 def deposited_elsewhere(
     engine: Engine,
     route: str,
@@ -974,6 +1201,7 @@ def deposited_elsewhere(
     attempt: int,
     content_type: str = "audio/wav",
     kind: str = "output",
+    creneau: dict | None = None,
 ) -> dict | None:
     """Fait calculer **et deposer** par la capacite louee, sans porter un octet.
 
@@ -1017,8 +1245,8 @@ def deposited_elsewhere(
             logger.info("moteur sans sortie differee, repli sur les octets")
             return None
 
-        concession = backend.deposit_grant_for(
-            job_id, attempt, kind, taille, empreinte, content_type
+        concession = _concession_de_depot(
+            backend, creneau, job_id, attempt, kind, taille, empreinte, content_type
         )
         if concession is None:
             return None
@@ -1244,6 +1472,7 @@ def enhance_audio(
     ailleurs = deposited_elsewhere(
         engine, "/enhance", corps, relay, backend,
         assignment["jobId"], assignment["attempt"],
+        creneau=assignment.get("outputSlot"),
     )
     if ailleurs is not None:
         # La sortie est deja sur R2 : aucun octet n'a traverse cette machine.
@@ -1309,6 +1538,7 @@ def transfer_performance(
     ailleurs = deposited_elsewhere(
         engine, "/convert", corps, relay, backend,
         assignment["jobId"], assignment["attempt"],
+        creneau=assignment.get("outputSlot"),
     )
     if ailleurs is not None:
         # L'operation qui gagne le plus : deux entrees pour une sortie, donc
