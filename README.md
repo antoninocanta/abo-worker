@@ -192,6 +192,44 @@ un modèle chacun et n'en changent pas selon la voix. Une même machine peut don
 porter le nettoyage et le transfert sans arbitrage ; y ajouter Qwen demande de
 compter.
 
+## Relais Vast pour les opérations sans état
+
+`AUDIO_ENHANCE` et `PERFORMANCE_TRANSFER` peuvent aussi être portés par un
+agent de confiance qui relaie vers un endpoint serverless Vast (`ABOB-133`).
+Ce relais reste un **worker ABO normal** : le job passe d'abord par la file,
+l'équité et le bail du scheduler ; Vast n'entre en jeu qu'après l'attribution.
+
+Le provisionneur automatique du backend reste un autre processus et ne reçoit
+jamais de bail. Cette séparation évite de donner les droits d'un worker au
+service qui loue et détruit des machines.
+
+Une URL moteur de relais prend cette forme :
+
+```text
+clearervoice|audio.clearervoice|1|vast+serverless://Clearer%20Voice/enhance
+```
+
+Seules les routes `/enhance` et `/convert` sont utilisables de cette manière.
+L'agent refuse localement `TTS`, `VOICE_CLONE` et `VOICE_DESIGN`, même si le
+registre était mal configuré. Le secret de compte Vast demeure dans le relais ;
+le worker serverless ne reçoit que l'enveloppe signée de son endpoint.
+
+Le workflow publie pour chaque moteur audio une variante `:serverless`, mince
+au-dessus de la même image et des mêmes poids. Chaque déploiement Vast configure
+`ABO_SERVERLESS_ROUTE=/enhance` ou `/convert` ; des versions de modèle
+différentes restent dans des endpoints distincts, pour que l'autoscaler ne
+puisse jamais les intervertir.
+
+Le fichier `deploy/vast-relay.compose.yml` isole son démarrage. Son identité
+ABO doit être créée en `RENTED`, afin que le scheduler n'envoie jamais un job
+différé sur du calcul facturé à la requête :
+
+```bash
+docker compose -p abo_backend exec api \
+  python -m app.workers.cli create "relais Vast stateless" RENTED vast-relay
+docker compose -f deploy/vast-relay.compose.yml up -d
+```
+
 ## Le protocole fait autorité côté backend
 
 Le contrat entre un worker et ABO — enregistrement, pouls, attribution d'un
