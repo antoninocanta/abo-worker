@@ -1,25 +1,66 @@
 # Relais de confiance pour les seules operations sans etat (`ABOB-133`).
 #
-# Ce processus est un worker ABO normal : il s'enrole, tire un bail, hydrate
-# ses entrees, puis seulement demande un executant au routeur serverless Vast.
-# Il ne provisionne aucune instance et reste distinct du gateway de fournisseur.
+# Ce processus est un worker ABO normal : il rejoint le maillage, s'enrole, tire
+# un bail, puis seulement demande un executant au routeur serverless Vast. Il ne
+# provisionne aucune instance et reste distinct du gateway de fournisseur.
 #
 # Son identite doit etre creee `RENTED`, puisque chaque execution qu'elle
-# represente est facturee chez Vast. Le scheduler exclut ainsi le niveau
-# differe de ce chemin.
+# represente est facturee chez Vast. Le scheduler exclut ainsi le niveau differe
+# de ce chemin.
+#
+#   docker compose -p abo_backend exec api \
+#     python -m app.workers.cli create "relais Vast" RENTED vast-relay
+#
+# **Aucun moteur ici**, et c'est tout le sujet : le calcul vit chez Vast. Ce
+# conteneur est un pilote, pas un porteur — il ne doit voir passer aucun octet
+# d'utilisateur (`ADR-016` § 3).
 services:
   vast-relay:
     build: ../agent
     restart: unless-stopped
+    # --- Le maillage, condition d'existence d'un worker (`ADR-015` § 1) -------
+    #
+    # Identique a l'agent ordinaire, et pour la meme raison : un `PROXY` est un
+    # worker comme un autre du point de vue du backend. Ce bloc manquait ici —
+    # ce fichier precedait `ABOB-156` — et l'entrypoint refusait de demarrer,
+    # ce qui etait la bonne reponse a une mauvaise configuration.
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - mesh_state:/var/lib/tailscale
     environment:
-      ABO_BACKEND_URL: ${ABO_BACKEND_URL:-https://api.abo.example}
+      # L'adresse de **maillage** du backend : la surface machine n'est plus
+      # servie par le tunnel public depuis `ABOB-157`. Une adresse IP, pas un
+      # nom — MagicDNS est desactive des deux cotes, a dessein.
+      ABO_BACKEND_URL: ${ABO_BACKEND_URL:?adresse de maillage du backend requise (http://100.x.y.z:8080)}
+      # Le tunnel public, pour une seule chose : faire remonter l'URL de
+      # validation du maillage a la console. Au moment ou elle existe, cette
+      # machine n'a pas d'adresse de maillage.
+      ABO_BACKEND_PUBLIC_URL: ${ABO_BACKEND_PUBLIC_URL:-}
       ABO_WORKER_KEY: ${ABO_VAST_RELAY_WORKER_KEY:?identifiant du relais requis}
       ABO_WORKER_SECRET: ${ABO_VAST_RELAY_WORKER_SECRET:?secret du relais requis}
+      ABO_TAILSCALE_EXPECTED_ACCOUNT: ${ABO_TAILSCALE_EXPECTED_ACCOUNT:-}
+      ABO_MESH_LOGIN_TIMEOUT: ${ABO_MESH_LOGIN_TIMEOUT:-900}
+      # **Le seul secret de tiers que porte ce conteneur.** Il ne quitte jamais
+      # le relais : ce qui part chez Vast est l'enveloppe signee de l'endpoint,
+      # jamais cette cle-ci (`ADR-009` § 5).
       ABO_VAST_API_KEY: ${ABO_VAST_API_KEY:?cle Vast requise}
       # Exemple :
-      # clearervoice|audio.clearervoice|1|vast+serverless://Clearer%20Voice/enhance,
-      # chatterbox|voice.chatterbox|1|vast+serverless://Follow%20My%20Lead/convert
+      # clearervoice|audio.clearervoice|1|vast+serverless://wzhryx07/enhance|PROXY
+      #
+      # Le mode se **deduit** de l'adresse — `vast+serverless://` est un `PROXY`
+      # et l'agent refuse de se declarer autrement — mais l'ecrire ne coute rien
+      # et dit l'intention a qui lit le deploiement.
       ABO_ENGINES: ${ABO_VAST_RELAY_ENGINES:?endpoints Vast requis}
       ABO_WORKER_GPU: vast-serverless
       ABO_VAST_ROUTE_TIMEOUT: ${ABO_VAST_ROUTE_TIMEOUT:-300}
       ABO_VAST_ROUTE_POLL_SECONDS: ${ABO_VAST_ROUTE_POLL_SECONDS:-2}
+
+volumes:
+  # L'identite du noeud de maillage de ce relais. Distincte de celle d'un agent
+  # ordinaire : deux workers sont deux machines pour le backend, meme s'ils
+  # tournent sur le meme hote.
+  mesh_state:
