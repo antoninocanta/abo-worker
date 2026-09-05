@@ -76,6 +76,23 @@ def test_l_annonce_va_au_tunnel_public_et_pas_a_l_adresse_de_maillage(environnem
     assert corps == {"loginUrl": URL, "nodeName": "abo-wk-bb200444ff62"}
 
 
+def test_le_client_se_nomme_car_urllib_anonyme_est_bloque(environnement, poste):
+    """Mesure du 05/09 contre le vrai tunnel, et elle a coûté une épreuve.
+
+    Cloudflare refuse le `User-Agent` par défaut d'`urllib` —
+    `Python-urllib/3.12` — avec un `403` portant son propre code `1010`. Il
+    ressemble à un refus d'ABO et n'en est pas un : la requête n'atteint jamais
+    l'application. Tout autre nom rend `401`, c'est-à-dire ABO qui répond.
+    """
+    mesh_announce.announce(URL, "abo-wk-x")
+
+    (requete,) = poste
+    envoye = requete.get_header("User-agent")
+    assert envoye, "aucun User-Agent : urllib poserait le sien, et il est bloqué"
+    assert "urllib" not in envoye.lower()
+    assert envoye == mesh_announce.AGENT
+
+
 def test_le_secret_voyage_en_entete_et_jamais_en_argument(environnement, poste):
     """`ps` est lisible par tout ce qui tourne dans le conteneur.
 

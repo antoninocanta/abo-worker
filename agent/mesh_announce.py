@@ -36,6 +36,16 @@ import urllib.request
 # seul chemin qui marche toujours.
 DELAI = 10.0
 
+# **Un client qui ne se nomme pas se fait refuser avant d'atteindre ABO.**
+# Cloudflare bloque le `User-Agent` par defaut d'`urllib` — `Python-urllib/3.12`
+# — avec un `403` et son propre code `1010`, qui ressemble a un refus d'ABO et
+# n'en est pas un. Mesure du 05/09 contre le vrai tunnel : `Python-urllib/3.12`
+# rend `403`, tout autre nom rend `401`, c'est-a-dire ABO qui repond.
+#
+# Ce n'est pas un contournement : c'est ce qu'un filtre attend d'un client
+# automatique, et ca donne un nom a chercher dans les journaux du tunnel.
+AGENT = "abo-worker-agent"
+
 
 def _poste(chemin: str, corps: dict) -> dict | None:
     racine = (os.getenv("ABO_BACKEND_PUBLIC_URL") or "").rstrip("/")
@@ -57,7 +67,11 @@ def _poste(chemin: str, corps: dict) -> dict | None:
         data=json.dumps(corps).encode("utf-8"),
         # Le secret voyage en en-tete, jamais en argument de commande : `ps`
         # est lisible par tout ce qui tourne dans le conteneur.
-        headers={"Content-Type": "application/json", "X-Worker-Secret": secret},
+        headers={
+            "Content-Type": "application/json",
+            "X-Worker-Secret": secret,
+            "User-Agent": AGENT,
+        },
         method="POST",
     )
     try:
