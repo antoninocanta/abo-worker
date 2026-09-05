@@ -60,6 +60,10 @@ class ConvertRequest(BaseModel):
     reference_b64: str = ""
     reference_url: str = ""
     reference_sha256: str = ""
+    # Forme differee (`ADR-016` § 4) : la sortie reste ici et le porteur
+    # n'en recoit que la designation. Mis par l'agent quand le moteur est de
+    # l'autre cote d'Internet.
+    defer_output: bool = False
     config: dict = {}
 
 
@@ -143,7 +147,7 @@ def convert(request: ConvertRequest):
     rendered_bytes = aboengine.to_wav(audio, MODEL_RATE)
 
     try:
-        payload = aboengine.rendered(rendered_bytes, "chatterbox-vc")
+        payload = aboengine.rendered(rendered_bytes, "chatterbox-vc", request.defer_output)
     except aboengine.AudioError as failure:
         return aboengine.fail(502, str(failure))
 
@@ -154,3 +158,7 @@ def convert(request: ConvertRequest):
         payload["silence_ratio"] * 100,
     )
     return payload
+
+
+# `/upload` et `/drop`, identiques sur tous les moteurs (`ADR-016` § 4).
+aboengine.register_deposit_routes(app)

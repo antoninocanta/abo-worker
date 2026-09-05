@@ -10,9 +10,8 @@ duree, et il est faux.
 import base64
 import hashlib
 
-import pytest
-
 import aboengine
+import pytest
 
 OCTETS = b"une prise a nettoyer"
 EMPREINTE = hashlib.sha256(OCTETS).hexdigest()

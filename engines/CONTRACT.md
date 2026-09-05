@@ -46,6 +46,53 @@ puisqu'il est la capacité locale bon marché ; et **`qwen3_tts`**, dont l'entr�
 lourde est un profil de voix servi par le cache de la machine et non par le
 bail.
 
+**Et la sortie ne revient pas non plus, quand `defer_output` est posé.** Même
+raison, sens inverse : un `PROXY` pilote, il ne relaie pas. Le moteur garde son
+résultat et ne rend que de quoi le désigner.
+
+| `defer_output` | ce que la route rend |
+|---|---|
+| absent ou faux | `audio_b64`, comme avant |
+| **vrai** | `output_id`, `size_bytes`, `sha256` — **aucun octet** |
+
+Le porteur fait alors signer une concession sur **ces valeurs exactes**, ce qui
+laisse `ADR-011` et `ADR-013` intacts : les octets existent au moment de signer,
+ils sont juste ailleurs. Puis il rappelle `/upload` **dans la même session
+Vast**, qui épingle le conteneur — donc le fichier est là.
+
+**Le contrôle du silence passe avant.** Une sortie muette n'obtient jamais
+d'`output_id` : le porteur n'a rien à déposer, plutôt que de découvrir le vide
+après avoir fait signer une concession.
+
+### `POST /upload` — déposer ce qui a été gardé
+
+```json
+{"output_id": "…32 hexa…", "put_url": "https://…", "headers": {"content-length": "…"}}
+```
+
+Suit la concession **telle quelle**, sans ajouter le moindre en-tête, puis
+oublie le temporaire. Rend `{"deposited": true, "status", "size_bytes"}`.
+
+| refus | ce qu'il veut dire |
+|---|---|
+| `422` | `output_id` inconnu, déjà déposé, ou adresse qui n'est pas en `https` — rejouer ailleurs ne changera rien |
+| `502` | le stockage a refusé ou n'a pas répondu. **Le temporaire est conservé** : le porteur peut redemander une concession et rejouer sans qu'un chapitre de trois minutes soit recalculé |
+
+`output_id` revient du réseau et n'est accepté que s'il est **exactement** l'un
+des nôtres — 32 hexadécimaux. Sans cette borne, un `../` ferait déposer ou
+effacer n'importe quel fichier du conteneur, et le porteur n'est pas forcément
+celui qui a généré l'identifiant.
+
+### `POST /drop` — le filet
+
+Même corps, `output_id` seul. Oublie une sortie sans la déposer, pour le cas où
+`/upload` n'arrive jamais. Idempotent.
+
+`aboengine.register_deposit_routes(app)` installe les deux, identiques sur tous
+les moteurs. Un moteur servi en serverless doit **aussi** les déclarer dans son
+`HandlerConfig`, sinon le PyWorker ne les relaie pas — le moteur les exposerait
+et l'échec arriverait chez un client sans que rien ne l'explique.
+
 **Les clés sont en `snake_case`.** Le backend et l'agent parlent camelCase entre
 eux ; à partir de l'agent, on descend en snake_case. La frontière est nette, et
 c'est l'agent qui traduit.

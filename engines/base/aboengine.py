@@ -14,7 +14,9 @@ import binascii
 import hashlib
 import io
 import os
+import re
 import struct
+import urllib.error
 import urllib.request
 import wave
 from pathlib import Path
@@ -38,6 +40,15 @@ SILENCE_THRESHOLD = 64
 
 class AudioError(ValueError):
     """L'entree n'est pas exploitable, et le dire vaut mieux que deviner."""
+
+
+class DepositError(RuntimeError):
+    """Le stockage a refuse ou n'a pas repondu.
+
+    Distinct d'`AudioError` parce que le contrat moteur en tire deux codes
+    differents : ce qui ne se rejouera pas mieux ailleurs, et ce qui compte une
+    tentative de plus.
+    """
 
 
 def fail(status: int, message: str) -> JSONResponse:
@@ -229,17 +240,25 @@ def weights_present(marker: str | None = None, root: str | None = None) -> bool:
     return next((path for path in base.rglob("*") if path.is_file()), None) is not None
 
 
-def rendered(raw: bytes, engine: str) -> dict:
+def rendered(raw: bytes, engine: str, defer: bool = False) -> dict:
     """La reponse d'un moteur, avec sa mesure — ou une erreur si c'est muet.
 
     Rendre du silence n'est jamais un succes : le laisser passer facturerait
     une prise vide et la ferait decouvrir a l'ecoute, des heures plus tard.
+
+    `defer` rend la forme **differee** (`ADR-016` § 4) : la sortie reste ici, et
+    ce qui remonte est de quoi la designer — `output_id`, taille, empreinte. Le
+    porteur demande alors une concession sur ces valeurs **exactes**, la rend a
+    `/upload`, et aucun octet ne traverse sa ligne.
+
+    L'ordre compte : **le controle du silence passe avant le differe.** Une
+    sortie muette n'obtient donc jamais d'`output_id`, et le porteur n'a rien a
+    deposer — plutot que de decouvrir le vide apres avoir signe une concession.
     """
     measured = inspect(raw)
     if measured["peak"] == 0:
         raise AudioError("le moteur a rendu du silence")
-    return {
-        "audio_b64": encode(raw),
+    commun = {
         "format": "wav",
         "size_bytes": len(raw),
         "engine": engine,
@@ -247,3 +266,131 @@ def rendered(raw: bytes, engine: str) -> dict:
         "silence_ratio": measured["silenceRatio"],
         "duration_seconds": measured["durationSeconds"],
     }
+    if defer:
+        return {**commun, **keep(raw)}
+    return {**commun, "audio_b64": encode(raw)}
+
+
+# ---- la sortie differee ----------------------------------------------------
+#
+# Deux appels dans une **session** Vast, qui epingle un conteneur : `/generate`
+# calcule et garde, `/upload` depose. Ce n'est pas de l'etat entre deux
+# invocations — c'est une seule instance et deux requetes, garanti par
+# `# Session is bound to this worker - can't re-route` dans le client Vast.
+#
+# Le repertoire vit dans le conteneur et meurt avec lui. Rien a nettoyer sur un
+# hote loue qu'on ne reverra pas.
+OUTPUT_ROOT = Path(os.environ.get("ABO_ENGINE_OUTPUT_DIR", "/tmp/abo-sorties"))  # noqa: S108
+
+
+def _output_path(output_id: str) -> Path:
+    """Refuse tout identifiant qui n'est pas un des notres.
+
+    `output_id` revient **du reseau**. Sans cette borne, un `../` ferait deposer
+    ou effacer n'importe quel fichier du conteneur — et le porteur n'est pas
+    forcement celui qui a genere l'identifiant.
+    """
+    if not re.fullmatch(r"[0-9a-f]{32}", output_id or ""):
+        raise AudioError("output_id invalide")
+    return OUTPUT_ROOT / f"{output_id}.bin"
+
+
+def keep(raw: bytes) -> dict:
+    """Garde la sortie le temps de la session, et rend de quoi la designer.
+
+    L'empreinte est calculee **ici**, sur les octets qui seront deposes. C'est
+    elle que le backend signera dans la concession, et R2 l'opposera : un corps
+    non conforme rend `400 BadDigest`, mesure le 05/09.
+    """
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    output_id = hashlib.sha256(os.urandom(32)).hexdigest()[:32]
+    _output_path(output_id).write_bytes(raw)
+    return {
+        "output_id": output_id,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def deposit(output_id: str, url: str, headers: dict | None = None) -> dict:
+    """Suit une concession d'ecriture, puis oublie le temporaire.
+
+    Les en-tetes viennent de la concession et partent **tels quels** : ce sont
+    eux qui portent la taille et l'empreinte signees. En ajouter ou en retirer
+    un ferait refuser toute la requete par R2.
+    """
+    chemin = _output_path(output_id)
+    if not chemin.exists():
+        raise AudioError("sortie inconnue ou deja deposee")
+    if not url.startswith("https://"):
+        raise AudioError("une concession de depot doit etre en https")
+
+    octets = chemin.read_bytes()
+    requete = urllib.request.Request(
+        url, data=octets, headers=dict(headers or {}), method="PUT"
+    )
+    try:
+        with urllib.request.urlopen(requete, timeout=FETCH_TIMEOUT_SECONDS) as reponse:
+            code = reponse.status
+    except urllib.error.HTTPError as refus:
+        # **Le temporaire n'est pas supprime.** Un refus du stockage peut venir
+        # d'une concession mal signee de notre cote : garder le fichier laisse
+        # le porteur redemander une concession et rejouer `/upload` sans que
+        # rien ne soit recalcule. La session finira par le nettoyer.
+        raise DepositError(f"depot refuse par le stockage ({refus.code})") from refus
+    except OSError as failure:
+        raise DepositError(f"stockage injoignable ({failure})") from failure
+
+    drop(output_id)
+    return {"deposited": True, "status": code, "size_bytes": len(octets)}
+
+
+def register_deposit_routes(app) -> None:
+    """Ajoute `/upload` et `/drop` a un moteur, identiques partout.
+
+    Ecrit une fois plutot que cinq : trois moteurs partagent deja `decode` et
+    `rendered`, et les laisser diverger sur le depot garantirait qu'ils
+    divergent — c'est ce que le socle existe pour empecher.
+
+    Les deux codes de refus disent des choses differentes, et le contrat en
+    depend : `422` pour ce qui ne se rejouera pas mieux ailleurs — un
+    `output_id` inconnu, une adresse qui n'est pas en `https` — et `502` pour un
+    echec du stockage, qui compte une tentative de plus.
+    """
+    from pydantic import BaseModel
+
+    class DepotRequest(BaseModel):
+        output_id: str
+        put_url: str = ""
+        # Les en-tetes de la concession. Ils portent la taille et l'empreinte
+        # signees, et partent tels quels.
+        headers: dict = {}
+
+    @app.post("/upload")
+    def upload(request: DepotRequest):
+        try:
+            return deposit(request.output_id, request.put_url, request.headers)
+        except AudioError as failure:
+            return fail(422, str(failure))
+        except DepositError as failure:
+            return fail(502, str(failure))
+
+    @app.post("/drop")
+    def relacher(request: DepotRequest):
+        """Le filet du nettoyage, pour le cas ou `/upload` n'arrive jamais.
+
+        Appele par `on_close_route` a la fermeture de session. Idempotent : il
+        n'y a rien a signaler si le depot a deja eu lieu.
+        """
+        return {"dropped": drop(request.output_id)}
+
+
+def drop(output_id: str) -> bool:
+    """Oublie une sortie. Idempotent : la fermeture de session repasse ici."""
+    try:
+        chemin = _output_path(output_id)
+    except AudioError:
+        return False
+    if chemin.exists():
+        chemin.unlink()
+        return True
+    return False

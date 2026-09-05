@@ -47,13 +47,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def do_GET(self) -> None:  # noqa: N802 - impose par http.server
+    def do_GET(self) -> None:
         if self.path == "/health":
             self._send(200, {"status": "ok", "engine": True})
         else:
             self._send(404, {"error": "inconnu"})
 
-    def do_POST(self) -> None:  # noqa: N802 - impose par http.server
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
 

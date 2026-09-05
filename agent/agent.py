@@ -74,7 +74,15 @@ import httpx
 #          dans le compose. Le numero le dit parce qu'un operateur qui lit
 #          `agent_version` dans la console doit savoir si cette machine est sur
 #          le maillage ou pas.
-AGENT_VERSION = "0.8.0"
+#   0.9.0  **la sortie ne traverse plus le porteur** (`ADR-016` § 4,
+#          `ABOB-173`). Deux appels dans une session Vast, qui epingle un
+#          conteneur : la route du moteur avec `defer_output`, puis `/upload`
+#          avec une concession signee sur la taille et l'empreinte que le moteur
+#          a annoncees. Aucun octet, aucun rappel vers ABO, aucun secret ABO
+#          chez Vast. Repli complet sur le base64 quand la concession n'est pas
+#          confiable — un chemin qui echouerait en silence serait pire que son
+#          absence.
+AGENT_VERSION = "0.9.0"
 
 BACKEND_URL = os.getenv("ABO_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 WORKER_KEY = os.getenv("ABO_WORKER_KEY", "")
@@ -108,6 +116,13 @@ ENGINE_READY_POLL_SECONDS = float(os.getenv("ABO_AGENT_ENGINE_READY_POLL", "3"))
 # afin qu'un worker froid garde encore le temps de calculer et de rendre.
 VAST_ROUTE_TIMEOUT = float(os.getenv("ABO_VAST_ROUTE_TIMEOUT", "300"))
 VAST_ROUTE_POLL_SECONDS = float(os.getenv("ABO_VAST_ROUTE_POLL_SECONDS", "2"))
+# Duree de vie d'une session Vast, **declaree et pas subie**. Chaque requete la
+# rajoute a l'expiration cote serveur, donc elle n'a pas a couvrir tout le
+# travail : seulement le plus long silence entre deux appels, ici l'aller-retour
+# de concession sur le maillage. Le defaut du client Vast est de 60 s ; on prend
+# large parce qu'une session qui expire au milieu perdrait le fichier, et que
+# quelques secondes de location valent moins qu'un chapitre a recalculer.
+VAST_SESSION_LIFETIME = float(os.getenv("ABO_VAST_SESSION_LIFETIME", "300"))
 
 STATELESS_OPERATIONS = frozenset({"AUDIO_ENHANCE", "PERFORMANCE_TRANSFER"})
 SERVERLESS_ROUTE_BY_OPERATION = {
@@ -341,11 +356,15 @@ class VastServerlessRelay:
             self._tls_client = httpx.Client(verify=context)
         return self._tls_client
 
-    def post(self, engine: Engine, payload: dict) -> httpx.Response:
-        endpoint = self.endpoint(engine)
+    def _route(self, endpoint: VastEndpoint) -> tuple[str, dict]:
+        """Demande au routeur Vast une instance libre, et attend s'il n'y en a pas.
+
+        Rendu a part parce que **deux chemins en ont besoin et un seul doit
+        recommencer** : un appel simple route a chaque fois, une session route
+        une seule fois puis reste collee a l'instance qu'elle a obtenue.
+        """
         request_idx = 0
         deadline = time.monotonic() + VAST_ROUTE_TIMEOUT
-
         while True:
             response = self._client.post(
                 VAST_SERVERLESS_URL + "/route/",
@@ -374,23 +393,132 @@ class VastServerlessRelay:
             )
             worker_url = route.get("url")
             if worker_url:
-                break
+                return str(worker_url), route
             if time.monotonic() >= deadline:
                 raise EngineError("Aucun worker Vast disponible avant l'expiration du bail.")
             time.sleep(VAST_ROUTE_POLL_SECONDS)
 
-        client = self._worker_client(str(worker_url))
+    def _send(
+        self,
+        endpoint: VastEndpoint,
+        worker_url: str,
+        route: str,
+        auth_data: dict,
+        payload: dict,
+        session_id: str | None = None,
+    ) -> httpx.Response:
+        client = self._worker_client(worker_url)
         return client.post(
-            str(worker_url).rstrip("/") + (engine.serverless_route or ""),
+            worker_url.rstrip("/") + route,
             headers=self._auth(endpoint.api_key),
             params={"api_key": endpoint.api_key},
-            json={"auth_data": route, "session_id": None, "payload": payload},
+            json={"auth_data": auth_data, "session_id": session_id, "payload": payload},
             timeout=ENGINE_TIMEOUT,
+        )
+
+    def post(self, engine: Engine, payload: dict) -> httpx.Response:
+        endpoint = self.endpoint(engine)
+        worker_url, route = self._route(endpoint)
+        return self._send(
+            endpoint, worker_url, engine.serverless_route or "", route, payload
+        )
+
+    def open_session(self, engine: Engine, lifetime: float) -> "VastSession":
+        """Ouvre une session, et **s'y colle**.
+
+        C'est ce qui rend la sortie differee possible : le client Vast route une
+        session une seule fois, et le sien porte le commentaire qui tranche —
+        `# Session is bound to this worker - can't re-route`. Les deux appels
+        atteignent donc le meme conteneur, donc le meme systeme de fichiers.
+
+        `lifetime` est **declare et pas subi**. Chaque requete le rajoute a
+        l'expiration (`session.expiration += session.lifetime` cote serveur),
+        donc il n'a pas a couvrir tout le travail — seulement le plus long des
+        silences entre deux appels, ici l'aller-retour de concession sur le
+        maillage. Le defaut du client Vast est de 60 s, et un defaut n'est pas
+        une decision : une session qui expire au milieu perdrait le fichier.
+        """
+        endpoint = self.endpoint(engine)
+        worker_url, route = self._route(endpoint)
+        response = self._send(
+            endpoint, worker_url, "/session/create", route, {"lifetime": lifetime}
+        )
+        if response.status_code != 200:
+            raise EngineError(
+                f"Session Vast refusee ({response.status_code}) {response.text[:200]}"
+            )
+        try:
+            session_id = response.json()["payload"]["session_id"]
+        except (ValueError, KeyError, TypeError):
+            # Certaines versions rendent la charge a plat. On accepte les deux
+            # plutot que d'echouer sur une enveloppe.
+            try:
+                session_id = response.json()["session_id"]
+            except (ValueError, KeyError, TypeError) as failure:
+                raise EngineError("Session Vast sans identifiant.") from failure
+        return VastSession(
+            relay=self,
+            endpoint=endpoint,
+            session_id=str(session_id),
+            worker_url=worker_url,
+            auth_data=route,
         )
 
     def close(self) -> None:
         if self._tls_client is not None:
             self._tls_client.close()
+
+
+@dataclass
+class VastSession:
+    """Une session Vast, collee a une instance.
+
+    Ce qu'elle garantit n'est pas de notre fait : c'est le client Vast qui
+    refuse de rerouter une session, et le serveur qui rend `410` sur une session
+    inconnue. Ce que **nous** garantissons est de ne jamais redemander de route
+    tant qu'elle vit — sans quoi on perdrait l'affinite en croyant l'avoir.
+    """
+
+    relay: "VastServerlessRelay"
+    endpoint: VastEndpoint
+    session_id: str
+    worker_url: str
+    auth_data: dict
+
+    def post(self, route: str, payload: dict) -> httpx.Response:
+        response = self.relay._send(
+            self.endpoint,
+            self.worker_url,
+            route,
+            self.auth_data,
+            payload,
+            session_id=self.session_id,
+        )
+        if response.status_code == 410:
+            # Le worker qui portait cette session a disparu. Ce n'est pas une
+            # panne a masquer : le job repart ailleurs, et la reprise sait deja
+            # le faire (`specs/17`).
+            raise EngineError("La session Vast a ete fermee par le worker.")
+        return response
+
+    def close(self) -> None:
+        """Termine la session. Un echec ici ne fait pas echouer un travail fini.
+
+        Le ramasse-miettes du worker ferme les sessions expirees tout seul
+        (`__session_gc_loop`), donc au pire on a perdu quelques secondes de
+        location — jamais un resultat deja depose.
+        """
+        try:
+            self.relay._send(
+                self.endpoint,
+                self.worker_url,
+                "/session/end",
+                self.auth_data,
+                {"session_id": self.session_id},
+                session_id=self.session_id,
+            )
+        except (httpx.HTTPError, EngineError) as failure:
+            logger.warning("fermeture de session Vast echouee : %s", failure)
 
 
 def hardware() -> dict:
@@ -624,13 +752,39 @@ class Backend:
         donc une reponse, pas une panne — et c'est le seul code qu'on traite
         ainsi, pour ne pas confondre « pas cette version » avec « refuse ».
         """
+        return self.deposit_grant_for(
+            job_id,
+            attempt,
+            kind,
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+            content_type,
+        )
+
+    def deposit_grant_for(
+        self,
+        job_id: str,
+        attempt: int,
+        kind: str,
+        size_bytes: int,
+        sha256: str,
+        content_type: str,
+    ) -> dict | None:
+        """La meme concession, **sans tenir les octets** (`ADR-016` § 4).
+
+        Quand le calcul a eu lieu sur une capacite louee, l'agent n'a jamais la
+        sortie : le moteur la garde le temps de la session et n'annonce que sa
+        taille et son empreinte. Les contraintes signees sont donc exactement
+        les memes — c'est ce qui permet a `ADR-011` et `ADR-013` de tenir tels
+        quels alors qu'aucun octet ne traverse cette machine.
+        """
         response = self._post(
             f"/jobs/{job_id}/media/grant",
             {
                 "attempt": attempt,
                 "kind": kind,
-                "sizeBytes": len(payload),
-                "sha256": hashlib.sha256(payload).hexdigest(),
+                "sizeBytes": size_bytes,
+                "sha256": sha256,
                 "contentType": content_type,
             },
         )
@@ -794,6 +948,113 @@ def audio_fields(
     return {name + "_b64": octets} if octets else {}
 
 
+def _rendu(response: httpx.Response) -> dict:
+    """La charge d'une reponse de moteur, enveloppee ou non.
+
+    Le PyWorker rend parfois `{"payload": {...}}`, parfois la charge a plat
+    selon la version. Accepter les deux vaut mieux qu'echouer sur une enveloppe
+    — le moteur, lui, a fait son travail.
+    """
+    try:
+        corps = response.json()
+    except ValueError as failure:
+        raise EngineError("Le moteur a rendu une reponse illisible.") from failure
+    if isinstance(corps, dict) and isinstance(corps.get("payload"), dict):
+        return corps["payload"]
+    return corps if isinstance(corps, dict) else {}
+
+
+def deposited_elsewhere(
+    engine: Engine,
+    route: str,
+    body: dict,
+    relay: VastServerlessRelay | None,
+    backend: "Backend",
+    job_id: str,
+    attempt: int,
+    content_type: str = "audio/wav",
+    kind: str = "output",
+) -> dict | None:
+    """Fait calculer **et deposer** par la capacite louee, sans porter un octet.
+
+    Deux appels dans une session Vast, qui epingle un conteneur (`ADR-016` § 4) :
+
+    1. la route du moteur avec `defer_output` — il calcule, garde le fichier et
+       rend `output_id`, taille et empreinte ;
+    2. le backend signe une concession sur ces valeurs **exactes**, sur le
+       maillage. `ADR-011` et `ADR-013` tiennent donc tels quels ;
+    3. `/upload` dans la **meme** session : le moteur suit la concession et
+       depose en direct sur R2, puis oublie son temporaire.
+
+    Rend `None` quand ce chemin n'est pas praticable, et l'appelant retombe
+    alors sur le base64 — qui marche toujours. Deux cas, et aucun ne doit
+    echouer en silence :
+
+    - le backend ne sait pas delivrer de concession (version anterieure) ;
+    - la concession n'est **pas une adresse absolue**. Une adresse relative
+      designe l'API d'ABO et exige le secret de cette machine : la donner a une
+      capacite louee reviendrait a le lui offrir, ce qu'`ADR-009` § 5 interdit.
+    """
+    if relay is None or not engine.is_serverless:
+        return None
+
+    session = relay.open_session(engine, lifetime=VAST_SESSION_LIFETIME)
+    try:
+        response = session.post(route, {**body, "defer_output": True})
+        if response.status_code == 501:
+            raise EngineError(f"{engine.engine_key} ne porte pas {route}")
+        if response.status_code != 200:
+            raise EngineError(f"{response.status_code} {response.text[:300]}")
+
+        rendu = _rendu(response)
+        output_id = str(rendu.get("output_id") or "")
+        taille = int(rendu.get("size_bytes") or 0)
+        empreinte = str(rendu.get("sha256") or "")
+        if not (output_id and taille and empreinte):
+            # Le moteur a repondu la forme directe : il est anterieur a
+            # `ADR-016`. On le dit plutot que de deviner, et l'appelant rejoue
+            # en base64 avec l'image qui tourne.
+            logger.info("moteur sans sortie differee, repli sur les octets")
+            return None
+
+        concession = backend.deposit_grant_for(
+            job_id, attempt, kind, taille, empreinte, content_type
+        )
+        if concession is None:
+            return None
+        adresse = str(concession.get("url") or "")
+        if not adresse.startswith("https://"):
+            logger.info("concession non absolue, repli sur les octets")
+            return None
+
+        depot = session.post(
+            "/upload",
+            {
+                "output_id": output_id,
+                "put_url": adresse,
+                # Les en-tetes portent la taille et l'empreinte signees, et
+                # partent tels quels : un `x-amz-*` en trop ou en moins fait
+                # refuser toute la requete.
+                "headers": dict(concession.get("headers") or {}),
+            },
+        )
+        if depot.status_code != 200:
+            raise EngineError(f"depot refuse : {depot.status_code} {depot.text[:200]}")
+
+        return {
+            "mediaId": concession["mediaId"],
+            "sha256": empreinte,
+            "sizeBytes": taille,
+            "metrics": {
+                "sizeBytes": taille,
+                "enginePath": rendu.get("engine", "unknown"),
+            },
+            "format": rendu.get("format", "wav"),
+        }
+    finally:
+        session.close()
+
+
 def _post_engine(
     client: httpx.Client,
     engine: Engine,
@@ -815,6 +1076,7 @@ def synthesize(
     backend: "Backend",
     config: dict,
     relay: VastServerlessRelay | None,
+    assignment: dict,
 ) -> dict:
     """Texte -> WAV. Le profil de voix appartient au backend, pas a la machine.
 
@@ -866,6 +1128,7 @@ def enrol_voice(
     backend: "Backend",
     config: dict,
     relay: VastServerlessRelay | None,
+    assignment: dict,
 ) -> dict:
     """Echantillon + transcription -> profil de voix.
 
@@ -911,6 +1174,7 @@ def design_voice(
     backend: "Backend",
     config: dict,
     relay: VastServerlessRelay | None,
+    assignment: dict,
 ) -> dict:
     """Description ecrite -> extrait audio d'une voix inventee.
 
@@ -958,6 +1222,7 @@ def enhance_audio(
     backend: "Backend",
     config: dict,
     relay: VastServerlessRelay | None,
+    assignment: dict,
 ) -> dict:
     """Une prise bruitee -> la meme prise, nettoyee.
 
@@ -975,11 +1240,25 @@ def enhance_audio(
     if not fields:
         raise EngineError("Aucun audio a nettoyer dans ce travail.")
 
+    corps = {**fields, "config": config}
+    ailleurs = deposited_elsewhere(
+        engine, "/enhance", corps, relay, backend,
+        assignment["jobId"], assignment["attempt"],
+    )
+    if ailleurs is not None:
+        # La sortie est deja sur R2 : aucun octet n'a traverse cette machine.
+        return {
+            "outputMediaId": ailleurs["mediaId"],
+            "outputSha256": ailleurs["sha256"],
+            "format": ailleurs["format"],
+            "metrics": ailleurs["metrics"],
+        }
+
     response = _post_engine(
         client,
         engine,
         "/enhance",
-        {**fields, "config": config},
+        corps,
         relay,
     )
     if response.status_code != 200:
@@ -1006,6 +1285,7 @@ def transfer_performance(
     backend: "Backend",
     config: dict,
     relay: VastServerlessRelay | None,
+    assignment: dict,
 ) -> dict:
     """Le jeu d'une prise, le timbre d'une autre.
 
@@ -1025,11 +1305,26 @@ def transfer_performance(
     if not reference:
         raise EngineError("Aucune voix de reference dans ce travail.")
 
+    corps = {**performance, **reference, "config": config}
+    ailleurs = deposited_elsewhere(
+        engine, "/convert", corps, relay, backend,
+        assignment["jobId"], assignment["attempt"],
+    )
+    if ailleurs is not None:
+        # L'operation qui gagne le plus : deux entrees pour une sortie, donc
+        # deux tiers du volume qui ne traversent plus la ligne du porteur.
+        return {
+            "outputMediaId": ailleurs["mediaId"],
+            "outputSha256": ailleurs["sha256"],
+            "format": ailleurs["format"],
+            "metrics": ailleurs["metrics"],
+        }
+
     response = _post_engine(
         client,
         engine,
         "/convert",
-        {**performance, **reference, "config": config},
+        corps,
         relay,
     )
     if response.status_code != 200:
@@ -1099,6 +1394,7 @@ def execute(
         backend,
         config,
         relay,
+        assignment,
     )
     payload["metrics"]["computeMs"] = int((time.monotonic() - started) * 1000)
     return _deposit_output(payload, assignment, backend)
