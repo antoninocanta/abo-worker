@@ -4,12 +4,22 @@
 # un bail, puis seulement demande un executant au routeur serverless Vast. Il ne
 # provisionne aucune instance et reste distinct du gateway de fournisseur.
 #
-# Son identite doit etre creee `RENTED`, puisque chaque execution qu'elle
-# represente est facturee chez Vast. Le scheduler exclut ainsi le niveau differe
-# de ce chemin.
+# Son identite se cree en **`OWNED`**, et l'inverse a ete essaye :
 #
 #   docker compose -p abo_backend exec api \
-#     python -m app.workers.cli create "relais Vast" RENTED vast-relay
+#     python -m app.workers.cli create "relais Vast" OWNED vast-relay
+#
+# En `RENTED`, la passerelle le revoque 90 secondes apres sa creation. Deux
+# regles justes separement s'annulaient : `ABOB-154` revoque **toute** identite
+# `RENTED` sans machine Vast correspondante — « quelle que soit la main qui l'a
+# louee » — et le relais est exactement ca, puisque le calcul qu'il pilote est
+# serverless et n'apparait dans aucune liste d'instances. Constate le 06/09 :
+# `WORKER_REVOKED` au premier enrolement.
+#
+# `ADR-016` § 1 tranche dans le meme sens : une machine louee n'est plus un
+# worker, mais une ressource qu'un `PROXY` pilote. Le `PROXY` est a nous.
+# Le differe reste ecarte de ce chemin par le **mode de la capacite**, qui est
+# le bon critere depuis `ADR-016` — pas par le mode de paiement de la machine.
 #
 # **Aucun moteur ici**, et c'est tout le sujet : le calcul vit chez Vast. Ce
 # conteneur est un pilote, pas un porteur — il ne doit voir passer aucun octet

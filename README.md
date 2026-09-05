@@ -220,15 +220,37 @@ au-dessus de la même image et des mêmes poids. Chaque déploiement Vast config
 différentes restent dans des endpoints distincts, pour que l'autoscaler ne
 puisse jamais les intervertir.
 
-Le fichier `deploy/vast-relay.compose.yml` isole son démarrage. Son identité
-ABO doit être créée en `RENTED`, afin que le scheduler n'envoie jamais un job
-différé sur du calcul facturé à la requête :
+Le fichier `deploy/vast-relay.compose.yml` isole son démarrage. Son identité ABO
+se crée en **`OWNED`** :
 
 ```bash
 docker compose -p abo_backend exec api \
-  python -m app.workers.cli create "relais Vast stateless" RENTED vast-relay
+  python -m app.workers.cli create "relais Vast stateless" OWNED vast-relay
 docker compose -f deploy/vast-relay.compose.yml up -d
 ```
+
+**`OWNED` et non `RENTED`, et ce n'est pas un détail.** Ce fichier disait
+l'inverse, et deux règles justes séparément s'annulaient :
+
+- `ABOB-154` fait révoquer par la passerelle **toute** identité `RENTED` sans
+  machine Vast correspondante, « quelle que soit la main qui l'a louée » — une
+  identité de location ne doit pas survivre à sa machine ;
+- le relais **est** une identité `RENTED` sans machine, puisque le calcul qu'il
+  pilote est serverless et n'apparaît dans aucune liste d'instances.
+
+Le relais se faisait donc révoquer 90 secondes après sa création, en production
+comme ici. Constaté le 06/09 : `WORKER_REVOKED` au premier enrôlement.
+
+Le modèle tranche, et dans le même sens : `ADR-016` § 1 dit qu'**une machine
+louée n'est plus un worker, mais une ressource qu'un `PROXY` pilote**. Le
+`PROXY`, lui, est une machine à nous — un portable chez un proche — donc
+`OWNED`. L'axe `compute_backend` dit **qui paie la machine**, pas comment le
+travail s'exécute.
+
+Le différé reste écarté de ce chemin, et par le bon critère : depuis `ADR-016`
+c'est le **mode d'exécution de la capacité** qui l'exclut, pas le mode de
+paiement de la machine. Une capacité `PROXY` ne reçoit jamais de différé, qu'elle
+soit portée par une machine `OWNED` ou `RENTED`.
 
 ## Le protocole fait autorité côté backend
 
