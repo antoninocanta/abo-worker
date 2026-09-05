@@ -90,8 +90,17 @@ import httpx
 #          qu'elle confie a une capacite louee. Plus aucun aller-retour de plan
 #          de controle par media. La version compte : le bail ne porte de creneau
 #          de sortie qu'a partir d'ici.
-AGENT_VERSION = "0.10.0"
+#   0.11.0 l'URL de validation du maillage **remonte a la console** au lieu
+#          d'attendre dans un journal (`ABOB-157`). L'entrypoint l'annonce, puis
+#          annonce l'issue — l'adresse obtenue et le compte qui a valide, ou le
+#          motif de l'echec. C'est le seul appel que la machine passe hors du
+#          maillage, et il va donc a la surface **publique** : `ABO_BACKEND_URL`
+#          designe desormais l'adresse de maillage du backend, et lui seul.
+AGENT_VERSION = "0.11.0"
 
+# **L'adresse de maillage du backend** depuis `ABOB-157` — la surface machine
+# n'est plus servie par le tunnel public. Le defaut local reste ce qu'il etait :
+# il ne sert qu'a un agent lance a la main contre un backend de developpement.
 BACKEND_URL = os.getenv("ABO_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 WORKER_KEY = os.getenv("ABO_WORKER_KEY", "")
 WORKER_SECRET = os.getenv("ABO_WORKER_SECRET", "")

@@ -78,9 +78,22 @@ services:
       #
       # Le travail passe par le maillage et par lui seul : la surface machine
       # d'ABO n'est plus servie par le tunnel public, donc cette adresse-ci est
-      # une adresse de maillage — `http://100.x.y.z:8080`, le port 8080 du
-      # noeud `abo-backend`.
-      ABO_BACKEND_URL: ${ABO_BACKEND_URL:-http://abo-backend:8080}
+      # une adresse de maillage — le port 8080 du noeud `abo-backend`.
+      #
+      # **Une adresse IP, pas un nom.** MagicDNS est desactive des deux cotes
+      # (`--accept-dns=false`), et pour une bonne raison : reecrire le
+      # `resolv.conf` du conteneur casserait la resolution de tout ce qui est
+      # **hors** du maillage — R2, Vast, les fournisseurs de langue — alors que
+      # le maillage ne couvre que le lien machine <-> backend (`ADR-015` § 1).
+      # `http://abo-backend:8080` ne resoudrait donc nulle part.
+      #
+      #   ABO_BACKEND_URL=http://100.x.y.z:8080
+      #
+      # Sans valeur, le conteneur refuse de demarrer. C'est voulu : le defaut
+      # precedent — le tunnel public — rend maintenant `404` sur chaque route
+      # machine, et un worker qui echoue a chaque appel sans dire pourquoi coute
+      # plus cher qu'un conteneur qui ne demarre pas.
+      ABO_BACKEND_URL: ${ABO_BACKEND_URL:?adresse de maillage du backend requise (http://100.x.y.z:8080)}
       # Le tunnel public, et pour **une seule chose** : faire remonter l'URL de
       # validation du maillage a la console. Au moment ou cette URL existe,
       # cette machine n'a pas d'adresse de maillage — c'est la definition de
