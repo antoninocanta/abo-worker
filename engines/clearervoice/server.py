@@ -41,7 +41,12 @@ _models: dict = {}
 
 
 class EnhanceRequest(BaseModel):
-    audio_b64: str
+    # Une des deux formes, jamais les deux (`ADR-016` § 4) : les octets quand le
+    # moteur est dans le meme compose, une concession signee quand il est de
+    # l'autre cote d'Internet — un `PROXY` pilote, il ne relaie pas.
+    audio_b64: str = ""
+    audio_url: str = ""
+    audio_sha256: str = ""
     config: dict = {}
 
 
@@ -76,7 +81,9 @@ def health() -> dict:
 @app.post("/enhance")
 def enhance(request: EnhanceRequest):
     try:
-        raw = aboengine.decode(request.audio_b64)
+        raw = aboengine.source(
+            request.audio_b64, request.audio_url, request.audio_sha256, "audio"
+        )
         samples, rate = aboengine.read_wav(raw)
     except aboengine.AudioError as failure:
         return aboengine.fail(422, str(failure))

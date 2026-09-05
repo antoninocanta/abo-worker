@@ -11,13 +11,19 @@ Un moteur ne connait ni ABO, ni job, ni compte. Ce module non plus.
 """
 import base64
 import binascii
+import hashlib
 import io
 import os
 import struct
+import urllib.request
 import wave
 from pathlib import Path
 
 from fastapi.responses import JSONResponse
+
+# Une concession de lecture est joignable ou elle ne l'est pas. Attendre plus
+# longtemps ferait expirer le bail ABO avant que le moteur ait commence.
+FETCH_TIMEOUT_SECONDS = 30
 
 # Au-dela, l'entree n'est plus une prise mais une erreur. Le backend borne deja
 # la taille d'un travail (`JOB_MAX_AUDIO_SECONDS`) ; cette borne-ci est plus
@@ -52,6 +58,72 @@ def decode(payload: str) -> bytes:
 
 def encode(raw: bytes) -> str:
     return base64.b64encode(raw).decode("ascii")
+
+
+def source(b64: str = "", url: str = "", sha256: str = "", what: str = "audio") -> bytes:
+    """Les octets d'une entree, quelle que soit la forme qui l'annonce.
+
+    Deux formes, et c'est la **distance** qui les separe (`ADR-016` § 4) :
+
+    - `<what>_b64` quand l'agent et le moteur partagent un reseau Docker. Y
+      encoder un WAV coute un tiers de volume la ou il ne se paie pas, et le
+      moteur reste **sans acces sortant** ;
+    - `<what>_url` quand ils sont de part et d'autre d'Internet. Relayer ferait
+      alors porter chaque octet par la ligne montante d'un portable domestique
+      — 13,4 Mo par minute d'audio, calcules depuis le format — et un `PROXY`
+      est cense n'etre qu'un pilote.
+
+    L'URL est une concession signee et bornee : un objet, un verbe, une duree
+    courte (`ADR-011`). Le moteur la suit **telle quelle** et n'ajoute aucun
+    en-tete : un `x-amz-*` non signe fait refuser toute la requete par R2.
+
+    `sha256` n'est pas decoratif. Sur la forme base64, c'est l'agent qui
+    verifiait que le stockage avait bien rendu ce qui etait annonce ; en passant
+    une URL on lui retire ce controle, donc le moteur le reprend. Sans ca, la
+    garantie disparaitrait en silence — et un resultat calcule sur la mauvaise
+    matiere ne se voit dans aucun format de fichier.
+    """
+    if b64 and url:
+        raise AudioError(f"{what} : deux formes a la fois, il en faut une")
+    if b64:
+        raw = decode(b64)
+    elif url:
+        raw = _fetch(url, what)
+    else:
+        raise AudioError(f"{what} absent : ni octets ni reference")
+
+    if sha256:
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != sha256.lower():
+            raise AudioError(f"{what} : empreinte inattendue")
+    return raw
+
+
+def _fetch(url: str, what: str) -> bytes:
+    """Suit une concession de lecture, et refuse tout ce qui n'en est pas une.
+
+    `urllib` plutot qu'un client tiers : c'est un `GET` sur une URL presignee,
+    et ajouter une dependance a cinq images pour ca serait payer une
+    reconstruction complete a chaque avis de securite du client.
+    """
+    if not url.startswith("https://"):
+        # Une concession voyage en clair sur un lien qu'on n'administre pas. La
+        # refuser ici est le seul endroit ou personne ne peut l'oublier.
+        raise AudioError(f"{what} : une reference doit etre en https")
+    try:
+        # `https` est impose juste au-dessus : l'adresse ne peut donc etre ni un
+        # `file://` ni un `data:` deguise en concession.
+        with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_SECONDS) as response:
+            # Un octet de plus que la borne suffit a savoir que c'est trop : on
+            # ne lit pas 200 Mo pour decouvrir qu'on en refusait 199.
+            raw = response.read(MAX_INPUT_BYTES + 1)
+    except OSError as failure:
+        raise AudioError(f"{what} : reference injoignable ({failure})") from failure
+    if not raw:
+        raise AudioError(f"{what} vide")
+    if len(raw) > MAX_INPUT_BYTES:
+        raise AudioError(f"{what} trop volumineux")
+    return raw
 
 
 def read_wav(raw: bytes) -> tuple[list[int], int]:

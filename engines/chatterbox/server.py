@@ -47,8 +47,19 @@ _model = None
 
 
 class ConvertRequest(BaseModel):
-    audio_b64: str
-    reference_b64: str
+    # Deux entrées de natures opposées, et **deux formes possibles chacune**
+    # (`ADR-016` § 4) : les octets quand le moteur est dans le même compose, une
+    # concession signée quand il est de l'autre côté d'Internet.
+    #
+    # C'est l'opération où la référence par URL rapporte le plus : elle a deux
+    # entrées pour une sortie, donc relayer en base64 ferait porter au `PROXY`
+    # les deux tiers du volume d'un travail.
+    audio_b64: str = ""
+    audio_url: str = ""
+    audio_sha256: str = ""
+    reference_b64: str = ""
+    reference_url: str = ""
+    reference_sha256: str = ""
     config: dict = {}
 
 
@@ -88,8 +99,15 @@ def health() -> dict:
 @app.post("/convert")
 def convert(request: ConvertRequest):
     try:
-        performance = aboengine.decode(request.audio_b64)
-        reference = aboengine.decode(request.reference_b64)
+        performance = aboengine.source(
+            request.audio_b64, request.audio_url, request.audio_sha256, "audio"
+        )
+        reference = aboengine.source(
+            request.reference_b64,
+            request.reference_url,
+            request.reference_sha256,
+            "reference",
+        )
     except aboengine.AudioError as failure:
         return aboengine.fail(422, str(failure))
 

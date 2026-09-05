@@ -200,7 +200,16 @@ class _RelayResult:
         )
 
 
-def test_le_bail_abo_est_hydrate_avant_que_vast_voie_le_job():
+def test_la_forme_ancienne_par_octets_atteint_encore_vast():
+    """Un bail qui porte deja les octets n'a pas de reference a confier.
+
+    Ce test s'appelait « le bail est hydrate avant que Vast voie le job », ce
+    qui enonçait la regle inverse de celle d'`ADR-016` § 4 : un `PROXY` ne
+    relaie **pas** les octets. Il ne mesurait pourtant que la forme ancienne
+    d'`ADR-010` § 6, ou l'entree arrive en `audioB64` et ou il n'y a rien
+    d'autre a faire. Le nom promettait une regle que le cas n'etablissait pas —
+    exactement ce qui fait qu'un lecteur pressé apprend le contraire du vrai.
+    """
     relay = _RelayResult()
     assignment = {
         "jobId": "job-1",
@@ -226,6 +235,114 @@ def test_le_bail_abo_est_hydrate_avant_que_vast_voie_le_job():
     }
     assert result["audioB64"] == base64.b64encode(b"clean").decode()
     assert result["metrics"]["enginePath"] == "vast-test"
+
+
+class _BackendQuiCompteSesLectures(_BackendWithoutStorage):
+    """Un backend qui note chaque octet qu'on lui fait relayer.
+
+    C'est la mesure du critere d'`ABOB-133` : le `PROXY` ne doit transporter
+    **aucun octet d'utilisateur**. Ici on ne peut pas regarder une interface
+    reseau, mais on peut constater que l'agent n'a jamais suivi la concession.
+    """
+
+    def __init__(self):
+        self.fetches = []
+
+    def fetch(self, grant):
+        self.fetches.append(grant)
+        return b"source"
+
+
+SHA_SOURCE = "41cf6794ba4200b839c53531555f0f3998df4cbb01a4d5cb0b94e3ca5e23947d"
+
+_CONCESSION = {
+    "grant": {"url": "https://r2.test/travail/objet?sig=abc", "method": "GET"},
+    "sha256": SHA_SOURCE,
+}
+
+
+def _assignation(entree: dict) -> dict:
+    return {
+        "jobId": "job-1",
+        "attempt": 1,
+        "operation": "AUDIO_ENHANCE",
+        "engineKey": "clearervoice",
+        "engineConfig": {"mode": "denoise"},
+        "input": entree,
+    }
+
+
+def test_un_moteur_loue_recoit_la_reference_et_pas_les_octets():
+    """Le coeur d'`ADR-016` § 4 : un `PROXY` pilote, il ne relaie pas.
+
+    La machine louee lit sur R2 elle-meme. L'agent ne suit donc **jamais** la
+    concession — c'est ce que compte `fetches`, et c'est la seule assertion qui
+    prouve que la ligne du porteur reste libre.
+    """
+    relay = _RelayResult()
+    backend = _BackendQuiCompteSesLectures()
+
+    with httpx.Client() as client:
+        agent.execute(
+            client, {"clearervoice": _engine()}, _assignation({"audio": _CONCESSION}), backend, relay
+        )
+
+    assert relay.calls[0][1] == {
+        "audio_url": "https://r2.test/travail/objet?sig=abc",
+        # L'empreinte part avec la reference : l'agent ne lit plus, donc il ne
+        # peut plus verifier, donc le moteur reprend ce controle.
+        "audio_sha256": SHA_SOURCE,
+        "config": {"mode": "denoise"},
+    }
+    assert backend.fetches == [], "le PROXY a relaye des octets"
+
+
+@pytest.mark.parametrize(
+    "grant",
+    [
+        # Une adresse relative designe l'API d'ABO, et l'agent y ajoute le
+        # secret de la machine : la passer a un moteur loue le lui donnerait.
+        {"url": "/v1/workers/wk/media/xyz", "method": "GET"},
+        # Une concession a en-tetes ne se suit pas sans eux, et un moteur n'en
+        # envoie aucun : un `x-amz-*` non signe ferait refuser toute la requete.
+        {"url": "https://r2.test/o", "method": "GET", "headers": {"x-amz-meta": "1"}},
+        # Un verbe d'ecriture n'est pas une lecture.
+        {"url": "https://r2.test/o", "method": "PUT"},
+    ],
+)
+def test_une_concession_qu_on_ne_peut_pas_confier_retombe_sur_les_octets(grant):
+    """L'optimisation qui echoue doit hydrater, jamais fabriquer un `403`.
+
+    Chacun de ces trois cas est une raison de **ne pas** confier l'adresse. Le
+    base64 marche toujours : preferer un chemin muet serait pire que l'absence
+    d'optimisation.
+    """
+    relay = _RelayResult()
+    backend = _BackendQuiCompteSesLectures()
+    entree = {"audio": {"grant": grant, "sha256": SHA_SOURCE}}
+
+    with httpx.Client() as client:
+        agent.execute(client, {"clearervoice": _engine()}, _assignation(entree), backend, relay)
+
+    envoye = relay.calls[0][1]
+    assert "audio_url" not in envoye
+    assert envoye["audio_b64"] == base64.b64encode(b"source").decode()
+    assert backend.fetches == [grant]
+
+
+def test_un_moteur_local_recoit_toujours_les_octets():
+    """La forme locale ne change pas, et c'est voulu.
+
+    Sur un reseau Docker le base64 ne se paie pas, et le moteur reste **sans
+    acces sortant** — lui donner R2 elargirait sa surface sans rien acheter.
+    """
+    local = agent.Engine("clearervoice", "audio.clearervoice", 1, "http://clearervoice:18100")
+    backend = _BackendQuiCompteSesLectures()
+
+    champs = agent.audio_fields({"audio": _CONCESSION}, "audio", backend, local)
+
+    assert champs == {"audio_b64": base64.b64encode(b"source").decode()}
+    assert backend.fetches == [_CONCESSION["grant"]]
 
 
 def test_une_operation_avec_etat_natteint_jamais_vast():

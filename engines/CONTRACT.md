@@ -10,8 +10,41 @@ Un moteur écoute sur `127.0.0.1` ou sur le réseau interne du compose. Il
 
 ## Les règles qui valent pour tous
 
-**L'audio circule en base64, jamais en fichier.** L'agent et le moteur peuvent
-vivre dans deux conteneurs ; un chemin partagé serait un couplage de plus.
+**L'audio circule en base64 ou par référence signée, jamais en fichier.**
+L'agent et le moteur peuvent vivre dans deux conteneurs ; un chemin partagé
+serait un couplage de plus.
+
+**C'est la distance qui choisit la forme** (`ADR-016` § 4), et l'agent décide
+seul — un moteur accepte les deux et ne sait pas laquelle il recevra.
+
+| le moteur est… | ce qu'il reçoit | pourquoi |
+|---|---|---|
+| dans le même compose | `<clé>_b64` | un réseau Docker ne coûte rien, et le moteur reste **sans accès sortant** |
+| de l'autre côté d'Internet | `<clé>_url` + `<clé>_sha256` | relayer ferait porter **13,4 Mo par minute d'audio** à la ligne montante d'un portable domestique, alors qu'un `PROXY` est censé n'être qu'un pilote |
+
+La règle est **les octets prennent le chemin le plus court**. Garder le base64
+en local n'est pas une tiédeur : c'est ce qui préserve l'isolement d'un moteur
+qui n'a aucune raison de joindre R2.
+
+Un moteur qui reçoit `<clé>_url` :
+
+- suit l'adresse **telle quelle**, sans ajouter le moindre en-tête. Un
+  `x-amz-*` non signé fait refuser toute la requête par R2, `403`, et l'oubli
+  ne se rattrape nulle part plus loin ;
+- **vérifie `<clé>_sha256`**. Sur la forme base64 c'est l'agent qui confrontait
+  ce que le stockage rendait à ce qui était annoncé ; en passant une adresse on
+  lui retire ce contrôle, donc le moteur le reprend. Sans ça la garantie
+  disparaîtrait en silence, et un résultat calculé sur la mauvaise matière ne se
+  voit dans aucun format de fichier ;
+- refuse les deux formes à la fois, et refuse une adresse qui n'est pas en
+  `https`.
+
+`aboengine.source()` fait les trois. Deux moteurs restent volontairement en
+base64 seul : **`deepfilternet`**, qui n'a ni torch ni socle partagé — c'est ce
+qui lui permet de tenir sur une machine sans carte — et qu'on ne loue jamais
+puisqu'il est la capacité locale bon marché ; et **`qwen3_tts`**, dont l'entrée
+lourde est un profil de voix servi par le cache de la machine et non par le
+bail.
 
 **Les clés sont en `snake_case`.** Le backend et l'agent parlent camelCase entre
 eux ; à partir de l'agent, on descend en snake_case. La frontière est nette, et

@@ -709,8 +709,12 @@ def audio_from(job_input: dict, name: str, backend: "Backend") -> str | None:
 
     **Le base64 ne disparait pas, il change de longueur de fil.** Les moteurs
     parlent JSON sur `127.0.0.1` : y encoder un WAV coute un tiers de volume
-    sur une boucle locale, ou il ne se paie pas. Ce qui coutait cher etait le
-    meme tiers sur un lien montant domestique, et c'est celui-la qui part.
+    sur une boucle locale, ou il ne se paie pas.
+
+    Cette derniere phrase etait fausse d'un cas, et c'est `ADR-016` § 4 qui l'a
+    releve : quand le moteur est **de l'autre cote d'Internet**, le meme tiers se
+    paie sur la ligne montante du porteur. Voir `audio_fields`, qui choisit la
+    forme selon la distance ; celle-ci reste la forme par octets.
     """
     ancien = job_input.get(name + "B64")
     if ancien:
@@ -726,6 +730,61 @@ def audio_from(job_input: dict, name: str, backend: "Backend") -> str | None:
         # resultat sur la mauvaise matiere, et personne ne le verrait.
         raise EngineError("Les octets recus ne correspondent pas a leur empreinte.")
     return base64.b64encode(octets).decode("ascii")
+
+
+def _passable(grant: dict | None) -> str | None:
+    """L'adresse d'une concession qu'on peut confier a un tiers, ou rien.
+
+    Deux refus, et les deux comptent :
+
+    - une adresse **relative** designe l'API d'ABO, et `Backend.fetch` y ajoute
+      le secret de cette machine. La passer a un moteur loue **lui donnerait ce
+      secret** — la faute exacte que `ADR-009` § 5 interdit ;
+    - une concession qui porte des **en-tetes** ne se suit pas sans eux, et un
+      moteur n'en envoie aucun a dessein : un `x-amz-*` non signe fait refuser
+      toute la requete par R2. Mieux vaut hydrater que fabriquer un `403` que
+      rien n'expliquera.
+
+    Dans les deux cas on retombe sur le base64, qui marche toujours. Une
+    optimisation qui echoue en silence serait pire que son absence.
+    """
+    if not grant:
+        return None
+    url = str(grant.get("url") or "")
+    if not url.startswith("https://") or grant.get("headers"):
+        return None
+    if str(grant.get("method", "GET")).upper() != "GET":
+        return None
+    return url
+
+
+def audio_fields(
+    job_input: dict, name: str, backend: "Backend", engine: Engine
+) -> dict:
+    """Le fragment de corps qui porte cette entree — octets, ou reference.
+
+    **C'est la distance qui decide** (`ADR-016` § 4). Un moteur dans le meme
+    compose recoit les octets : ca ne coute rien sur un reseau Docker, et il
+    reste sans acces sortant. Un moteur de l'autre cote d'Internet recoit une
+    **concession signee** et va lire lui-meme, parce qu'un `PROXY` est un pilote
+    et non un relais — relayer lui ferait porter 13,4 Mo par minute d'audio sur
+    une ligne domestique.
+
+    L'empreinte part avec la reference : c'est l'agent qui verifiait que le
+    stockage avait rendu ce qui etait annonce, et il ne peut plus le faire s'il
+    ne lit pas. Le moteur reprend ce controle plutot que de le perdre.
+    """
+    if engine.is_serverless:
+        reference = job_input.get(name) or {}
+        url = _passable(reference.get("grant"))
+        if url:
+            return {
+                name + "_url": url,
+                name + "_sha256": str(reference.get("sha256") or ""),
+            }
+
+    octets = audio_from(job_input, name, backend)
+    return {name + "_b64": octets} if octets else {}
 
 
 def _post_engine(
@@ -905,15 +964,15 @@ def enhance_audio(
     c'est ainsi qu'un meme moteur peut debruiter ici et regenerer la, sans deux
     images ni deux cles de moteur.
     """
-    audio = audio_from(job_input, "audio", backend)
-    if not audio:
+    fields = audio_fields(job_input, "audio", backend, engine)
+    if not fields:
         raise EngineError("Aucun audio a nettoyer dans ce travail.")
 
     response = _post_engine(
         client,
         engine,
         "/enhance",
-        {"audio_b64": audio, "config": config},
+        {**fields, "config": config},
         relay,
     )
     if response.status_code != 200:
@@ -952,8 +1011,8 @@ def transfer_performance(
     et il envoie l'echantillon d'origine — celui qu'`ADR-004` exige de garder
     precisement pour qu'un autre moteur puisse le lire.
     """
-    performance = audio_from(job_input, "audio", backend)
-    reference = audio_from(job_input, "reference", backend)
+    performance = audio_fields(job_input, "audio", backend, engine)
+    reference = audio_fields(job_input, "reference", backend, engine)
     if not performance:
         raise EngineError("Aucune performance dans ce travail.")
     if not reference:
@@ -963,7 +1022,7 @@ def transfer_performance(
         client,
         engine,
         "/convert",
-        {"audio_b64": performance, "reference_b64": reference, "config": config},
+        {**performance, **reference, "config": config},
         relay,
     )
     if response.status_code != 200:
