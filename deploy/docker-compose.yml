@@ -77,19 +77,26 @@ services:
       ABO_BACKEND_URL: ${ABO_BACKEND_URL:-https://api.abo.example}
       ABO_WORKER_KEY: ${ABO_WORKER_KEY:?identifiant de machine requis}
       ABO_WORKER_SECRET: ${ABO_WORKER_SECRET:?secret d enrolement requis}
-      # Cle d'enrolement au maillage. **Reutilisable, ephemere et taguee** :
-      # reutilisable pour n'avoir aucun secret par machine a distribuer,
-      # ephemere pour qu'un noeud eteint disparaisse tout seul — ce qui evite la
-      # collection de noeuds morts que la ferme a deja sur les workers `LOST` —
-      # et taguee pour que les ACL portent sur le tag et non sur des machines
-      # nommees une a une. Recette dans documentation/exploitation.md.
+      # **Aucune cle d'enrolement.** L'enrolement est manuel, une fois par
+      # machine : le conteneur affiche son URL de login au premier demarrage et
+      # attend qu'on la valide dans la console Tailscale. Les workers sont peu
+      # nombreux et durables, donc distribuer une cle reutilisable dans chaque
+      # conteneur couterait un secret de plus a faire tourner pour rien.
       #
-      # Requise au **premier** demarrage seulement : ensuite l'etat du noeud
-      # suffit, et l'entrypoint le sait.
-      ABO_TAILSCALE_AUTHKEY: ${ABO_TAILSCALE_AUTHKEY:-}
-      # Facultatif : un tailnet auto-heberge (Headscale) plutot que Tailscale.
-      ABO_TAILSCALE_LOGIN_SERVER: ${ABO_TAILSCALE_LOGIN_SERVER:-}
-      ABO_TAILSCALE_TAGS: ${ABO_TAILSCALE_TAGS:-}
+      # L'etat vit dans `mesh_state` : un `restart` ou un `up -d` apres
+      # reconstruction ne redemande aucune validation. Retirer une machine pour
+      # de bon se fait a la main dans la console, comme l'enrolement.
+      #
+      #   docker compose logs -f agent   # l'URL a valider
+      #
+      # Controle d'exploitation, facultatif : refuse de servir si le noeud a ete
+      # valide depuis un autre compte que celui-la. Une adresse email
+      # n'authentifie rien — c'est Tailscale qui authentifie — mais elle attrape
+      # l'erreur d'operateur qui fait entrer une machine dans le mauvais
+      # tailnet, donc dans un perimetre de confiance qui n'est pas le notre.
+      ABO_TAILSCALE_EXPECTED_ACCOUNT: ${ABO_TAILSCALE_EXPECTED_ACCOUNT:-}
+      # Combien de temps le conteneur attend la validation humaine.
+      ABO_MESH_LOGIN_TIMEOUT: ${ABO_MESH_LOGIN_TIMEOUT:-900}
       # Les moteurs portes, declares au backend a l'enrolement :
       #   engineKey|modelKey|versionNumber|url[|mode]
       # Le backend confronte cette declaration a son registre de modeles : un

@@ -7,14 +7,24 @@
 # de le laisser s'enroler par le tunnel public : ce serait exactement la dette
 # que le realignement retire, et elle serait invisible.
 #
-# Mode **noyau**, avec `/dev/net/tun` (arbitre par Onin le 05/09). Le mode
-# utilisateur reste a instruire ; l'objectif « installation en une passe » tient
-# parce que le device et les capacites se declarent dans le compose.
+# Mode **noyau**, avec `/dev/net/tun`. L'objectif « installation en une passe »
+# tient parce que le device et les capacites se declarent dans le compose.
+#
+# **Enrolement manuel, une fois par machine** (arbitre par Onin le 05/09). Pas
+# de cle reutilisable distribuee dans les conteneurs, pas de noeud ephemere :
+# les workers seront peu nombreux, et chacun se valide a la main dans la console
+# Tailscale. Le conteneur affiche son URL de login et attend ; l'etat persiste
+# ensuite dans un volume, donc un `restart` ou un `up -d` apres reconstruction
+# ne redemande rien.
 set -eu
 
 MAILLAGE_ETAT=/var/lib/tailscale/tailscaled.state
 MAILLAGE_SOCKET=/run/tailscale/tailscaled.sock
-ATTENTE_MAX=${ABO_MESH_READY_TIMEOUT:-60}
+SOCKET_MAX=${ABO_MESH_READY_TIMEOUT:-60}
+# Genereux : c'est un humain qui ouvre une URL dans un navigateur.
+LOGIN_MAX=${ABO_MESH_LOGIN_TIMEOUT:-900}
+
+ts() { tailscale --socket="$MAILLAGE_SOCKET" "$@"; }
 
 echec() {
     echo "abo-entrypoint: $1" >&2
@@ -23,24 +33,17 @@ echec() {
 
 # --- Ce que le conteneur doit avoir recu -------------------------------------
 #
-# On le verifie ici et pas dans l'agent : ces trois manques sont des defauts de
-# **deploiement**, et les diagnostiquer depuis un journal d'agent coute une
-# location. `ABOB-155` a paye ce defaut une fois — la machine tournait, notre
-# code n'existait pas, et rien ne disait pourquoi.
+# On le verifie ici et pas dans l'agent : c'est un defaut de **deploiement**, et
+# le diagnostiquer depuis un journal d'agent coute une location. `ABOB-155` a
+# paye ce defaut une fois — la machine tournait, notre code n'existait pas, et
+# rien ne disait pourquoi.
 
 [ -c /dev/net/tun ] || echec "/dev/net/tun absent. Le compose doit porter :
     devices:  [ \"/dev/net/tun:/dev/net/tun\" ]
     cap_add:  [ NET_ADMIN, NET_RAW ]
   Sans ce device, tailscaled ne peut pas creer d'interface en mode noyau."
 
-if [ -z "${ABO_TAILSCALE_AUTHKEY:-}" ] && [ ! -s "$MAILLAGE_ETAT" ]; then
-    echec "ABO_TAILSCALE_AUTHKEY est requis au premier demarrage.
-  Recette d'enrolement dans documentation/exploitation.md : une cle
-  reutilisable, ephemere et taguee, pour n'avoir ni secret par machine a
-  distribuer ni noeud mort a nettoyer."
-fi
-
-# --- Le noeud ----------------------------------------------------------------
+# --- Le demon ----------------------------------------------------------------
 
 mkdir -p /run/tailscale /var/lib/tailscale
 tailscaled --state="$MAILLAGE_ETAT" --socket="$MAILLAGE_SOCKET" --tun=tailscale0 &
@@ -51,37 +54,98 @@ MAILLAGE_PID=$!
 attendu=0
 while [ ! -S "$MAILLAGE_SOCKET" ]; do
     attendu=$((attendu + 1))
-    [ "$attendu" -lt "$ATTENTE_MAX" ] || echec "tailscaled n'a pas ouvert sa socket en ${ATTENTE_MAX}s."
+    [ "$attendu" -lt "$SOCKET_MAX" ] || echec "tailscaled n'a pas ouvert sa socket en ${SOCKET_MAX}s."
     kill -0 "$MAILLAGE_PID" 2>/dev/null || echec "tailscaled s'est arrete au demarrage."
     sleep 1
 done
 
+# --- Le noeud ----------------------------------------------------------------
+#
 # **Un nom de noeud est un label DNS, et une cle de machine n'en est pas un.**
 # Les cles sont de la forme `wk_ab12cd`, et l'underscore est refuse :
 # « "abo-wk_epreuve" is not a valid DNS label ». Sans cette traduction, *aucune*
 # machine ne pourrait s'enroler — mesure du 05/09, sur la premiere epreuve.
 NOM_NOEUD="abo-$(printf '%s' "${ABO_WORKER_KEY:-sans-cle}" | tr '_' '-' | tr -cd 'a-zA-Z0-9-')"
 
-# `--accept-dns=false` a dessein : reecrire le resolv.conf du conteneur casserait
-# la resolution de ce qui est **hors** du maillage — R2, Vast, les fournisseurs
-# de langue — et le maillage ne couvre que le lien machine <-> backend
-# (`ADR-015` § 1). On adresse donc le backend explicitement.
-#
-# `--hostname` porte la cle de la machine : un noeud anonyme dans une console de
-# maillage ne se revoque pas, faute de savoir lequel c'est.
-tailscale --socket="$MAILLAGE_SOCKET" up \
-    --accept-dns=false \
-    --hostname="$NOM_NOEUD" \
-    ${ABO_TAILSCALE_AUTHKEY:+--authkey="${ABO_TAILSCALE_AUTHKEY}"} \
-    ${ABO_TAILSCALE_LOGIN_SERVER:+--login-server="${ABO_TAILSCALE_LOGIN_SERVER}"} \
-    ${ABO_TAILSCALE_TAGS:+--advertise-tags="${ABO_TAILSCALE_TAGS}"} \
-    || echec "l'enrolement au maillage a echoue (noeud « ${NOM_NOEUD} »).
-  **La raison exacte est dans la ligne que tailscale vient d'ecrire au-dessus**,
-  et elle n'est pas toujours la cle : un nom de noeud invalide, un tag que la
-  cle ne porte pas et une cle expiree echouent tous ici. Ne pas deviner."
+adresse() { ts ip -4 2>/dev/null | head -n 1; }
 
-ADRESSE=$(tailscale --socket="$MAILLAGE_SOCKET" ip -4 2>/dev/null | head -n 1 || true)
-[ -n "$ADRESSE" ] || echec "aucune adresse de maillage obtenue. Un worker hors maillage n'est pas un worker (ADR-015 § 1)."
+if [ -n "$(adresse)" ]; then
+    echo "abo-entrypoint: deja enrole, etat repris du volume"
+else
+    # `--accept-dns=false` a dessein : reecrire le resolv.conf du conteneur
+    # casserait la resolution de ce qui est **hors** du maillage — R2, Vast, les
+    # fournisseurs de langue — et le maillage ne couvre que le lien
+    # machine <-> backend (`ADR-015` § 1). On adresse donc le backend
+    # explicitement.
+    #
+    # `--hostname` porte la cle de la machine : un noeud anonyme dans une
+    # console de maillage ne se revoque pas, faute de savoir lequel c'est.
+    echo "abo-entrypoint: premiere connexion au maillage — validation manuelle attendue"
+    echo "abo-entrypoint: ============================================================"
+    ts up --accept-dns=false --hostname="$NOM_NOEUD" --timeout="${LOGIN_MAX}s" 2>&1 &
+    LOGIN_PID=$!
+
+    # `tailscale up` ecrit l'URL puis attend. On surveille l'adresse plutot que
+    # la sortie du processus : c'est l'obtention d'une adresse qui prouve
+    # l'enrolement, pas un code de retour.
+    attendu=0
+    while [ -z "$(adresse)" ]; do
+        attendu=$((attendu + 5))
+        if [ "$attendu" -ge "$LOGIN_MAX" ]; then
+            echec "aucune validation en ${LOGIN_MAX}s.
+  L'URL de login est plus haut dans ce journal. La rejouer :
+    docker compose logs agent | grep login.tailscale.com
+  Un worker hors maillage n'est pas un worker (ADR-015 § 1)."
+        fi
+        kill -0 "$LOGIN_PID" 2>/dev/null || break
+        sleep 5
+    done
+    wait "$LOGIN_PID" 2>/dev/null || true
+    echo "abo-entrypoint: ============================================================"
+fi
+
+ADRESSE=$(adresse)
+[ -n "$ADRESSE" ] || echec "aucune adresse de maillage obtenue.
+  **La raison exacte est dans les lignes que tailscale vient d'ecrire au-dessus**
+  — un nom de noeud invalide, une validation refusee ou expiree echouent toutes
+  ici. Ne pas deviner.
+  Un worker hors maillage n'est pas un worker (ADR-015 § 1)."
+
+# --- Le compte qui a valide --------------------------------------------------
+#
+# Controle d'**exploitation**, et Onin l'a pose en sachant ce qu'il vaut : une
+# adresse email n'authentifie rien par elle-meme, c'est Tailscale qui
+# authentifie. Ce que ce controle attrape est une erreur d'operateur — un noeud
+# valide depuis le mauvais compte, donc entre dans le mauvais tailnet, donc dans
+# un perimetre de confiance qui n'est pas le notre.
+#
+# **On refuse plutot qu'on avertit**, parce que le maillage *est* le perimetre de
+# confiance de la ferme (`ADR-015` § 1) : un avertissement dans un journal que
+# personne ne lit laisserait tourner une machine mal placee. Le controle est
+# facultatif — sans la variable, rien n'est verifie.
+if [ -n "${ABO_TAILSCALE_EXPECTED_ACCOUNT:-}" ]; then
+    COMPTE=$(ts status --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    etat = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+moi = (etat.get("Self") or {}).get("UserID")
+utilisateur = (etat.get("User") or {}).get(str(moi)) or {}
+print(utilisateur.get("LoginName", ""))
+' 2>/dev/null || true)
+    if [ -z "$COMPTE" ]; then
+        echo "abo-entrypoint: compte de validation illisible, controle non effectue" >&2
+    elif [ "$COMPTE" != "$ABO_TAILSCALE_EXPECTED_ACCOUNT" ]; then
+        echec "ce noeud a ete valide par « ${COMPTE} », attendu « ${ABO_TAILSCALE_EXPECTED_ACCOUNT} ».
+  Le maillage est le perimetre de confiance de la ferme : un noeud dans le
+  mauvais tailnet n'est pas un detail de configuration.
+  Retirer la machine dans la console Tailscale, supprimer le volume d'etat
+  (\`docker volume rm deploy_mesh_state\`), et recommencer."
+    else
+        echo "abo-entrypoint: valide par ${COMPTE}"
+    fi
+fi
 
 echo "abo-entrypoint: sur le maillage, adresse ${ADRESSE}"
 
