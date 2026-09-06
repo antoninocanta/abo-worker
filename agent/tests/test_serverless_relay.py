@@ -780,3 +780,73 @@ def test_un_reenrolement_ne_sonde_pas_une_url_serverless(monkeypatch):
         agent.run()
 
     assert waits == [[], []]
+
+
+@pytest.mark.parametrize("code", [200, 201, 202])
+def test_une_session_est_acceptee_sur_toute_reponse_de_succes(monkeypatch, code):
+    """**Vast rend `201 Created`**, et c'est la reponse juste : il cree une
+    ressource.
+
+    Le code exigeait `200`. Une session parfaitement valide — identifiant et
+    expiration presents dans le corps — etait donc jetee, et le job brulait ses
+    trois tentatives en deux secondes. Mesure du 06/09, premiere epreuve reelle
+    contre le vrai routeur Vast.
+
+    **Aucun test ne pouvait le voir avant celui-ci** : le faux serveur rendait
+    `200`, c'est-a-dire exactement ce que le code attendait. Un montage qui
+    repond ce qu'on espere ne dit rien du serveur qu'on n'a pas encore appele —
+    et c'est le defaut le plus courant d'un test de transport.
+    """
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "console.test":
+            return httpx.Response(
+                200,
+                json={"results": [{"endpoint_name": "Clearer Voice", "api_key": "s"}]},
+            )
+        if request.url.host == "router.test":
+            return httpx.Response(
+                200, json={"request_idx": 7, "url": "http://worker.test:8000"}
+            )
+        if request.url.path == "/session/create":
+            return httpx.Response(code, json={"session_id": "sess-201"})
+        return httpx.Response(200, json=RENDU_DIFFERE)
+
+    monkeypatch.setattr(agent, "VAST_CONSOLE_URL", "https://console.test")
+    monkeypatch.setattr(agent, "VAST_SERVERLESS_URL", "https://router.test")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        relay = agent.VastServerlessRelay(client, api_key="account-secret")
+        monkeypatch.setattr(relay, "_worker_client", lambda _url: client)
+        session = relay.open_session(_engine(), lifetime=42.0)
+
+    assert session.session_id == "sess-201"
+
+
+@pytest.mark.parametrize("code", [400, 401, 410, 500, 503])
+def test_une_reponse_hors_succes_reste_un_refus(monkeypatch, code):
+    """La contrepartie, et elle compte autant.
+
+    Elargir a « la famille 2xx » doit rester un elargissement, pas un
+    relachement : un `410` sur une session dit que le worker a disparu, et
+    l'avaler ferait poursuivre un job vers un conteneur qui n'existe plus.
+    """
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "console.test":
+            return httpx.Response(
+                200,
+                json={"results": [{"endpoint_name": "Clearer Voice", "api_key": "s"}]},
+            )
+        if request.url.host == "router.test":
+            return httpx.Response(
+                200, json={"request_idx": 7, "url": "http://worker.test:8000"}
+            )
+        return httpx.Response(code, text="non")
+
+    monkeypatch.setattr(agent, "VAST_CONSOLE_URL", "https://console.test")
+    monkeypatch.setattr(agent, "VAST_SERVERLESS_URL", "https://router.test")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        relay = agent.VastServerlessRelay(client, api_key="account-secret")
+        monkeypatch.setattr(relay, "_worker_client", lambda _url: client)
+        with pytest.raises(agent.EngineError, match="Session Vast refusee"):
+            relay.open_session(_engine(), lifetime=42.0)

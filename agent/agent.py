@@ -96,7 +96,7 @@ import httpx
 #          motif de l'echec. C'est le seul appel que la machine passe hors du
 #          maillage, et il va donc a la surface **publique** : `ABO_BACKEND_URL`
 #          designe desormais l'adresse de maillage du backend, et lui seul.
-AGENT_VERSION = "0.11.0"
+AGENT_VERSION = "0.11.1"
 
 # **L'adresse de maillage du backend** depuis `ABOB-157` — la surface machine
 # n'est plus servie par le tunnel public. Le defaut local reste ce qu'il etait :
@@ -460,7 +460,14 @@ class VastServerlessRelay:
         response = self._send(
             endpoint, worker_url, "/session/create", route, {"lifetime": lifetime}
         )
-        if response.status_code != 200:
+        # **`201`, pas `200`.** Le worker Vast repond `201 Created` a une
+        # creation de session, ce qui est la reponse juste : il vient de creer
+        # une ressource. Exiger `200` faisait rejeter une session parfaitement
+        # valide — identifiant et expiration presents dans le corps — et le job
+        # brulait ses trois tentatives en deux secondes. Mesure du 06/09 sur la
+        # premiere epreuve reelle ; aucun test ne pouvait le voir, le faux
+        # serveur rendant ce que le code attendait.
+        if response.status_code // 100 != 2:
             raise EngineError(
                 f"Session Vast refusee ({response.status_code}) {response.text[:200]}"
             )
@@ -1271,7 +1278,7 @@ def deposited_elsewhere(
         response = session.post(route, {**body, "defer_output": True})
         if response.status_code == 501:
             raise EngineError(f"{engine.engine_key} ne porte pas {route}")
-        if response.status_code != 200:
+        if response.status_code // 100 != 2:
             raise EngineError(f"{response.status_code} {response.text[:300]}")
 
         rendu = _rendu(response)
@@ -1307,7 +1314,9 @@ def deposited_elsewhere(
                 "headers": dict(concession.get("headers") or {}),
             },
         )
-        if depot.status_code != 200:
+        # Meme lecon que la creation de session : c'est la **famille** du code
+        # qui dit le succes, pas sa valeur exacte.
+        if depot.status_code // 100 != 2:
             raise EngineError(f"depot refuse : {depot.status_code} {depot.text[:200]}")
 
         return {
